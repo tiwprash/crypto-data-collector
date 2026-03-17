@@ -9,7 +9,9 @@ from datetime import datetime
 # CONFIG
 # =============================
 
-BINANCE_BASE = "https://api.binance.com/api/v3/klines"
+# ✅ Use Binance Vision (NO 451 error)
+BINANCE_BASE = "https://data-api.binance.vision/api/v3/klines"
+
 INTERVAL = "1h"
 LIMIT = 1000
 
@@ -34,14 +36,14 @@ s3 = boto3.client(
 )
 
 # =============================
-# FETCH BINANCE DATA (SAFE)
+# FETCH BINANCE DATA
 # =============================
 
 def fetch_binance(symbol):
     all_data = []
     end_time = int(datetime.now().timestamp() * 1000)
 
-    for i in range(30):  # ~30k candles max
+    for i in range(10):  # keep small for testing
         try:
             params = {
                 "symbol": symbol,
@@ -53,33 +55,32 @@ def fetch_binance(symbol):
             response = requests.get(BINANCE_BASE, params=params)
 
             if response.status_code != 200:
-                print(f"HTTP Error {response.status_code}")
+                print(f"HTTP Error {response.status_code}", flush=True)
                 break
 
             res = response.json()
 
-            # ✅ HANDLE BINANCE ERRORS
+            # handle API errors
             if isinstance(res, dict):
-                print(f"Binance API Error: {res}")
+                print(f"API Error: {res}", flush=True)
                 break
 
             if not isinstance(res, list) or len(res) == 0:
-                print("No more data")
+                print("No more data", flush=True)
                 break
 
             df = pd.DataFrame(res)
-
             all_data.append(df)
 
-            # move backward in time
+            # move backward
             end_time = res[0][0]
 
-            print(f"{symbol} batch {i+1} fetched")
+            print(f"{symbol} batch {i+1} fetched", flush=True)
 
-            time.sleep(0.3)  # avoid rate limits
+            time.sleep(0.2)
 
         except Exception as e:
-            print(f"Error fetching {symbol}: {e}")
+            print(f"Error fetching {symbol}: {e}", flush=True)
             break
 
     if not all_data:
@@ -96,8 +97,7 @@ def fetch_binance(symbol):
 
     df["time"] = pd.to_datetime(df["time"], unit="ms")
 
-    # convert to numeric
-    for col in ["open", "high", "low", "close", "volume"]:
+    for col in ["open","high","low","close","volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df = df.drop_duplicates().sort_values("time")
@@ -115,12 +115,14 @@ def upload_to_r2(df, filename):
 
         df.to_parquet(file_path, index=False)
 
+        print(f"Uploading {filename} to R2...", flush=True)
+
         s3.upload_file(file_path, BUCKET_NAME, f"data/{filename}.parquet")
 
-        print(f"Uploaded to R2: {filename}")
+        print(f"✅ Uploaded: data/{filename}.parquet", flush=True)
 
     except Exception as e:
-        print(f"Upload error: {e}")
+        print(f"❌ Upload error: {e}", flush=True)
 
 
 # =============================
@@ -128,21 +130,30 @@ def upload_to_r2(df, filename):
 # =============================
 
 def main():
-    symbols = ["BTCUSDT", "ETHUSDT"]  # keep small for testing
+    print("🚀 SCRIPT STARTED", flush=True)
+
+    # 🔥 test upload first
+    test_df = pd.DataFrame({"test": [1, 2, 3]})
+    upload_to_r2(test_df, "test_file")
+
+    symbols = ["BTCUSDT", "ETHUSDT"]
 
     for symbol in symbols:
         try:
-            print(f"\nFetching {symbol}...")
+            print(f"\nFetching {symbol}...", flush=True)
 
             df = fetch_binance(symbol)
 
             if df is not None and not df.empty:
+                print(f"{symbol} fetched, uploading...", flush=True)
                 upload_to_r2(df, f"binance_{symbol}")
             else:
-                print(f"No valid data for {symbol}")
+                print(f"No valid data for {symbol}", flush=True)
 
         except Exception as e:
-            print(f"Error processing {symbol}: {e}")
+            print(f"Error processing {symbol}: {e}", flush=True)
+
+    print("✅ SCRIPT FINISHED", flush=True)
 
 
 if __name__ == "__main__":
