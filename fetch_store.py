@@ -9,14 +9,14 @@ from datetime import datetime
 # CONFIG
 # =============================
 
-# ✅ Use Binance Vision (NO 451 error)
-BINANCE_BASE = "https://data-api.binance.vision/api/v3/klines"
+# ✅ Binance Futures API
+BINANCE_FUTURES_BASE = "https://fapi.binance.com/fapi/v1/klines"
 
 INTERVAL = "1h"
 LIMIT = 1000
 
 # =============================
-# R2 CONFIG (FROM ENV)
+# R2 CONFIG
 # =============================
 
 R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY")
@@ -36,14 +36,14 @@ s3 = boto3.client(
 )
 
 # =============================
-# FETCH BINANCE DATA
+# FETCH BINANCE FUTURES DATA
 # =============================
 
-def fetch_binance(symbol):
+def fetch_binance_futures(symbol):
     all_data = []
     end_time = int(datetime.now().timestamp() * 1000)
 
-    for i in range(10):  # keep small for testing
+    for i in range(10):  # test mode
         try:
             params = {
                 "symbol": symbol,
@@ -52,7 +52,7 @@ def fetch_binance(symbol):
                 "endTime": end_time,
             }
 
-            response = requests.get(BINANCE_BASE, params=params)
+            response = requests.get(BINANCE_FUTURES_BASE, params=params)
 
             if response.status_code != 200:
                 print(f"HTTP Error {response.status_code}", flush=True)
@@ -60,7 +60,6 @@ def fetch_binance(symbol):
 
             res = response.json()
 
-            # handle API errors
             if isinstance(res, dict):
                 print(f"API Error: {res}", flush=True)
                 break
@@ -72,10 +71,9 @@ def fetch_binance(symbol):
             df = pd.DataFrame(res)
             all_data.append(df)
 
-            # move backward
             end_time = res[0][0]
 
-            print(f"{symbol} batch {i+1} fetched", flush=True)
+            print(f"{symbol} futures batch {i+1} fetched", flush=True)
 
             time.sleep(0.2)
 
@@ -117,9 +115,9 @@ def upload_to_r2(df, filename):
 
         print(f"Uploading {filename} to R2...", flush=True)
 
-        s3.upload_file(file_path, BUCKET_NAME, f"data/{filename}.parquet")
+        s3.upload_file(file_path, BUCKET_NAME, f"futures/{filename}.parquet")
 
-        print(f"✅ Uploaded: data/{filename}.parquet", flush=True)
+        print(f"✅ Uploaded: futures/{filename}.parquet", flush=True)
 
     except Exception as e:
         print(f"❌ Upload error: {e}", flush=True)
@@ -130,30 +128,26 @@ def upload_to_r2(df, filename):
 # =============================
 
 def main():
-    print("🚀 SCRIPT STARTED", flush=True)
-
-    # 🔥 test upload first
-    test_df = pd.DataFrame({"test": [1, 2, 3]})
-    upload_to_r2(test_df, "test_file")
+    print("🚀 FUTURES DATA PIPELINE STARTED", flush=True)
 
     symbols = ["BTCUSDT", "ETHUSDT"]
 
     for symbol in symbols:
         try:
-            print(f"\nFetching {symbol}...", flush=True)
+            print(f"\nFetching FUTURES {symbol}...", flush=True)
 
-            df = fetch_binance(symbol)
+            df = fetch_binance_futures(symbol)
 
             if df is not None and not df.empty:
-                print(f"{symbol} fetched, uploading...", flush=True)
-                upload_to_r2(df, f"binance_{symbol}")
+                filename = f"binance_futures_{symbol}"
+                upload_to_r2(df, filename)
             else:
                 print(f"No valid data for {symbol}", flush=True)
 
         except Exception as e:
             print(f"Error processing {symbol}: {e}", flush=True)
 
-    print("✅ SCRIPT FINISHED", flush=True)
+    print("✅ FUTURES PIPELINE FINISHED", flush=True)
 
 
 if __name__ == "__main__":
