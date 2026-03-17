@@ -2,17 +2,16 @@ import os
 import requests
 import pandas as pd
 import boto3
-from datetime import datetime, timedelta
+import time
+from datetime import datetime
 
 # =============================
 # CONFIG
 # =============================
 
 BINANCE_BASE = "https://api.binance.com/api/v3/klines"
-BYBIT_BASE = "https://api.bybit.com/v5/market/kline"
-
 INTERVAL = "1h"
-LIMIT = 1000  # max per request
+LIMIT = 1000
 
 # =============================
 # R2 CONFIG (FROM ENV)
@@ -35,35 +34,58 @@ s3 = boto3.client(
 )
 
 # =============================
-# FETCH BINANCE DATA
+# FETCH BINANCE DATA (SAFE)
 # =============================
 
 def fetch_binance(symbol):
-    data = []
+    all_data = []
     end_time = int(datetime.now().timestamp() * 1000)
 
-    for _ in range(30):  # loop for history
-        params = {
-            "symbol": symbol,
-            "interval": INTERVAL,
-            "limit": LIMIT,
-            "endTime": end_time,
-        }
+    for i in range(30):  # ~30k candles max
+        try:
+            params = {
+                "symbol": symbol,
+                "interval": INTERVAL,
+                "limit": LIMIT,
+                "endTime": end_time,
+            }
 
-        res = requests.get(BINANCE_BASE, params=params).json()
+            response = requests.get(BINANCE_BASE, params=params)
 
-        if not res:
+            if response.status_code != 200:
+                print(f"HTTP Error {response.status_code}")
+                break
+
+            res = response.json()
+
+            # ✅ HANDLE BINANCE ERRORS
+            if isinstance(res, dict):
+                print(f"Binance API Error: {res}")
+                break
+
+            if not isinstance(res, list) or len(res) == 0:
+                print("No more data")
+                break
+
+            df = pd.DataFrame(res)
+
+            all_data.append(df)
+
+            # move backward in time
+            end_time = res[0][0]
+
+            print(f"{symbol} batch {i+1} fetched")
+
+            time.sleep(0.3)  # avoid rate limits
+
+        except Exception as e:
+            print(f"Error fetching {symbol}: {e}")
             break
 
-        df = pd.DataFrame(res)
-        data.append(df)
-
-        end_time = res[0][0]  # move backward
-
-    if not data:
+    if not all_data:
         return None
 
-    df = pd.concat(data)
+    df = pd.concat(all_data)
 
     df.columns = [
         "time","open","high","low","close","volume",
@@ -71,7 +93,14 @@ def fetch_binance(symbol):
     ]
 
     df = df[["time","open","high","low","close","volume"]]
+
     df["time"] = pd.to_datetime(df["time"], unit="ms")
+
+    # convert to numeric
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.drop_duplicates().sort_values("time")
 
     return df
 
@@ -81,10 +110,17 @@ def fetch_binance(symbol):
 # =============================
 
 def upload_to_r2(df, filename):
-    file_path = f"/tmp/{filename}.parquet"
-    df.to_parquet(file_path, index=False)
+    try:
+        file_path = f"/tmp/{filename}.parquet"
 
-    s3.upload_file(file_path, BUCKET_NAME, f"data/{filename}.parquet")
+        df.to_parquet(file_path, index=False)
+
+        s3.upload_file(file_path, BUCKET_NAME, f"data/{filename}.parquet")
+
+        print(f"Uploaded to R2: {filename}")
+
+    except Exception as e:
+        print(f"Upload error: {e}")
 
 
 # =============================
@@ -92,15 +128,21 @@ def upload_to_r2(df, filename):
 # =============================
 
 def main():
-    symbols = ["BTCUSDT", "ETHUSDT"]  # replace with top 300 later
+    symbols = ["BTCUSDT", "ETHUSDT"]  # keep small for testing
 
     for symbol in symbols:
-        print(f"Fetching {symbol}...")
-        df = fetch_binance(symbol)
+        try:
+            print(f"\nFetching {symbol}...")
 
-        if df is not None:
-            upload_to_r2(df, f"binance_{symbol}")
-            print(f"Uploaded {symbol}")
+            df = fetch_binance(symbol)
+
+            if df is not None and not df.empty:
+                upload_to_r2(df, f"binance_{symbol}")
+            else:
+                print(f"No valid data for {symbol}")
+
+        except Exception as e:
+            print(f"Error processing {symbol}: {e}")
 
 
 if __name__ == "__main__":
