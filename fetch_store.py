@@ -38,7 +38,7 @@ s3 = boto3.client(
 BUCKET = os.getenv("R2_BUCKET")
 
 # =============================
-# STATE MANAGEMENT
+# JSON STATE HELPERS
 # =============================
 
 def load_json(key, default):
@@ -54,7 +54,7 @@ def save_json(key, data):
 
 
 # =============================
-# SYMBOL CACHE SYSTEM
+# SYMBOL SYSTEM (FINAL FIX)
 # =============================
 
 def fetch_symbols_from_api():
@@ -83,10 +83,8 @@ def fetch_symbols_from_api():
 
 def get_symbols():
     cache = load_json("state/top_symbols.json", {"date": "", "symbols": []})
-
     today = datetime.utcnow().strftime("%Y-%m-%d")
 
-    # 🔥 refresh once per day
     if cache["date"] != today:
         print("Refreshing symbol list...", flush=True)
 
@@ -95,12 +93,28 @@ def get_symbols():
         if new_symbols:
             cache = {"date": today, "symbols": new_symbols}
             save_json("state/top_symbols.json", cache)
-            print("Symbols updated", flush=True)
+            print(f"✅ Cached {len(new_symbols)} symbols", flush=True)
         else:
-            print("⚠️ API failed, using old symbols", flush=True)
+            print("⚠️ API failed", flush=True)
 
-    return cache["symbols"]
+    if cache["symbols"]:
+        return cache["symbols"]
 
+    # 🔥 FINAL FALLBACK (CRITICAL)
+    print("⚠️ Using fallback symbols", flush=True)
+
+    return [
+        {"symbol": "BTCUSDT"},
+        {"symbol": "ETHUSDT"},
+        {"symbol": "BNBUSDT"},
+        {"symbol": "SOLUSDT"},
+        {"symbol": "XRPUSDT"},
+        {"symbol": "ADAUSDT"},
+        {"symbol": "DOGEUSDT"},
+        {"symbol": "AVAXUSDT"},
+        {"symbol": "LINKUSDT"},
+        {"symbol": "MATICUSDT"}
+    ]
 
 # =============================
 # RETRY
@@ -115,7 +129,6 @@ def retry_request(url):
         except:
             time.sleep(1)
     return None
-
 
 # =============================
 # DATA HELPERS
@@ -135,26 +148,23 @@ def upload(df, path):
     s3.upload_file(file, BUCKET, path)
     print(f"✅ {path}", flush=True)
 
-
 # =============================
 # VALIDATION
 # =============================
 
-def validate(df, interval):
+def validate(df):
     try:
-        freq_map = {"1h": "1H"}
-        expected = pd.date_range(df["time"].min(), df["time"].max(), freq=freq_map[interval])
+        expected = pd.date_range(df["time"].min(), df["time"].max(), freq="1H")
         missing = len(expected) - len(df)
         return round(100 - (missing / len(expected) * 100), 2)
     except:
         return 0
 
-
 # =============================
 # BINANCE FETCH
 # =============================
 
-def fetch_binance(symbol, interval, existing):
+def fetch_binance(symbol, existing):
     all_df = []
 
     if existing is None:
@@ -162,7 +172,8 @@ def fetch_binance(symbol, interval, existing):
 
         for year in range(START_YEAR, CURRENT_YEAR + 1):
             for month in range(1, 13):
-                url = f"{BINANCE_BASE}/{symbol}/{interval}/{symbol}-{interval}-{year}-{str(month).zfill(2)}.zip"
+
+                url = f"{BINANCE_BASE}/{symbol}/1h/{symbol}-1h-{year}-{str(month).zfill(2)}.zip"
 
                 res = retry_request(url)
                 if not res:
@@ -187,7 +198,7 @@ def fetch_binance(symbol, interval, existing):
         year = time.strftime("%Y")
         month = time.strftime("%m")
 
-        url = f"{BINANCE_BASE}/{symbol}/{interval}/{symbol}-{interval}-{year}-{month}.zip"
+        url = f"{BINANCE_BASE}/{symbol}/1h/{symbol}-1h-{year}-{month}.zip"
 
         res = retry_request(url)
         if not res:
@@ -209,19 +220,18 @@ def fetch_binance(symbol, interval, existing):
 
     return pd.concat(all_df) if all_df else None
 
-
 # =============================
 # PROCESS
 # =============================
 
-def process_symbol(symbol_obj, interval):
+def process_symbol(symbol_obj):
     sym = symbol_obj["symbol"]
 
     try:
-        path = f"binance/futures/{interval}/{sym}.parquet"
+        path = f"binance/futures/1h/{sym}.parquet"
         existing = get_existing(path)
 
-        df = fetch_binance(sym, interval, existing)
+        df = fetch_binance(sym, existing)
 
         if df is not None:
             if existing is not None:
@@ -229,14 +239,13 @@ def process_symbol(symbol_obj, interval):
 
             df = df.drop_duplicates().sort_values("time")
 
-            score = validate(df, interval)
+            score = validate(df)
             print(f"{sym} Quality: {score}%", flush=True)
 
             upload(df, path)
 
     except Exception as e:
         print(f"Error {sym}: {e}", flush=True)
-
 
 # =============================
 # MAIN
@@ -264,8 +273,7 @@ def main():
     print(f"Processing {start} → {end}", flush=True)
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        for tf in TIMEFRAMES:
-            executor.map(lambda s: process_symbol(s, tf), selected)
+        executor.map(process_symbol, selected)
 
     print("✅ DONE", flush=True)
 
