@@ -1,12 +1,10 @@
 import os
-import requests
 import pandas as pd
 import boto3
 import zipfile
 import time
 import json
 from io import BytesIO
-from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
 # =============================
@@ -15,7 +13,6 @@ from concurrent.futures import ThreadPoolExecutor
 
 CHUNK_SIZE = 20
 MAX_WORKERS = 5
-RETRIES = 3
 
 START_YEAR = 2023
 CURRENT_YEAR = int(time.strftime("%Y"))
@@ -51,127 +48,19 @@ def save_json(key, data):
     s3.put_object(Bucket=BUCKET, Key=key, Body=json.dumps(data))
 
 # =============================
-# SYMBOL SYSTEM (FINAL FIX)
+# SYMBOL SOURCE (R2 ONLY)
 # =============================
 
-def get_binance_symbols():
-    print("Fetching Binance symbols...", flush=True)
+def get_symbols():
+    data = load_json("state/binance_symbols.json", {"symbols": []})
 
-    try:
-        url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
-        res = requests.get(url, timeout=10)
-
-        if res.status_code != 200:
-            raise Exception(f"HTTP {res.status_code}")
-
-        data = res.json()
-
-        if not isinstance(data, list):
-            print("⚠️ Binance returned error:", data)
-            return []
-
-        usdt_pairs = [x for x in data if x.get("symbol", "").endswith("USDT")]
-
-        sorted_data = sorted(
-            usdt_pairs,
-            key=lambda x: float(x.get("quoteVolume", 0)),
-            reverse=True
-        )
-
-        symbols = [{"symbol": x["symbol"]} for x in sorted_data[:300]]
-
-        print(f"✅ Binance symbols: {len(symbols)}", flush=True)
-
-        return symbols
-
-    except Exception as e:
-        print("❌ Binance API failed:", e, flush=True)
+    if not data["symbols"]:
+        print("⚠️ No symbols found in R2", flush=True)
         return []
 
+    print(f"✅ Loaded {len(data['symbols'])} symbols from R2", flush=True)
 
-def get_bybit_symbols(binance_symbols):
-    cache = load_json("state/bybit_symbols.json", {"symbols": []})
-
-    try:
-        print("Fetching Bybit symbols...", flush=True)
-
-        url = "https://api.bybit.com/v5/market/tickers?category=linear"
-        res = requests.get(url, timeout=10)
-
-        if res.status_code != 200:
-            raise Exception(f"HTTP {res.status_code}")
-
-        try:
-            data = res.json()
-        except:
-            raise Exception("Invalid JSON response")
-
-        if "result" not in data or "list" not in data["result"]:
-            raise Exception("Unexpected API format")
-
-        symbols = data["result"]["list"]
-
-        sorted_data = sorted(
-            symbols,
-            key=lambda x: float(x.get("turnover24h", 0)),
-            reverse=True
-        )
-
-        top = [{"symbol": x["symbol"]} for x in sorted_data[:300]]
-
-        save_json("state/bybit_symbols.json", {"symbols": top})
-
-        print(f"✅ Bybit symbols: {len(top)}", flush=True)
-
-        return top
-
-    except Exception as e:
-        print("⚠️ Bybit API failed:", e, flush=True)
-
-    # fallback
-    fallback = cache["symbols"]
-
-    if fallback:
-        print(f"Using cached Bybit symbols: {len(fallback)}", flush=True)
-    else:
-        print("No cached symbols, using base fallback", flush=True)
-        fallback = [
-            {"symbol": "BTCUSDT"},
-            {"symbol": "ETHUSDT"},
-            {"symbol": "SOLUSDT"},
-            {"symbol": "XRPUSDT"},
-        ]
-
-    # fill from binance
-    if len(fallback) < 300 and binance_symbols:
-        print("Filling missing symbols from Binance...", flush=True)
-
-        existing = set(x["symbol"] for x in fallback)
-
-        for coin in binance_symbols:
-            if coin["symbol"] not in existing:
-                fallback.append(coin)
-
-            if len(fallback) >= 300:
-                break
-
-    print(f"Final Bybit symbol count: {len(fallback)}", flush=True)
-
-    return fallback
-
-# =============================
-# RETRY
-# =============================
-
-def retry_request(url):
-    for _ in range(RETRIES):
-        try:
-            res = requests.get(url, timeout=10)
-            if res.status_code == 200:
-                return res
-        except:
-            time.sleep(1)
-    return None
+    return data["symbols"]
 
 # =============================
 # DATA HELPERS
@@ -212,7 +101,7 @@ def clean_dataframe(df):
     return df
 
 # =============================
-# FETCH BINANCE
+# FETCH BINANCE DATA
 # =============================
 
 def fetch_binance(symbol, existing):
@@ -226,12 +115,13 @@ def fetch_binance(symbol, existing):
 
                 url = f"{BINANCE_BASE}/{symbol}/1h/{symbol}-1h-{year}-{str(month).zfill(2)}.zip"
 
-                res = retry_request(url)
-
-                if not res or res.status_code != 200:
-                    continue
-
                 try:
+                    import requests
+                    res = requests.get(url, timeout=10)
+
+                    if res.status_code != 200:
+                        continue
+
                     with zipfile.ZipFile(BytesIO(res.content)) as z:
                         df = pd.read_csv(z.open(z.namelist()[0]), header=None)
 
@@ -240,8 +130,8 @@ def fetch_binance(symbol, existing):
                     if not df.empty:
                         all_df.append(df)
 
-                except Exception as e:
-                    print(f"Zip error {symbol}: {e}", flush=True)
+                except:
+                    continue
 
     else:
         last_time = existing["time"].max()
@@ -251,12 +141,13 @@ def fetch_binance(symbol, existing):
 
         url = f"{BINANCE_BASE}/{symbol}/1h/{symbol}-1h-{year}-{month}.zip"
 
-        res = retry_request(url)
-
-        if not res or res.status_code != 200:
-            return None
-
         try:
+            import requests
+            res = requests.get(url, timeout=10)
+
+            if res.status_code != 200:
+                return None
+
             with zipfile.ZipFile(BytesIO(res.content)) as z:
                 df = pd.read_csv(z.open(z.namelist()[0]), header=None)
 
@@ -266,11 +157,10 @@ def fetch_binance(symbol, existing):
             if not df.empty:
                 all_df.append(df)
 
-        except Exception as e:
-            print(f"Incremental error {symbol}: {e}", flush=True)
+        except:
+            return None
 
     if not all_df:
-        print(f"⚠️ No data found for {symbol}", flush=True)
         return None
 
     final_df = pd.concat(all_df)
@@ -279,7 +169,7 @@ def fetch_binance(symbol, existing):
     return final_df
 
 # =============================
-# PROCESS
+# PROCESS SYMBOL
 # =============================
 
 def process_symbol(symbol_obj):
@@ -307,12 +197,13 @@ def process_symbol(symbol_obj):
 # =============================
 
 def main():
-    print("🚀 FINAL PIPELINE STARTED", flush=True)
+    print("🚀 GITHUB PIPELINE STARTED", flush=True)
 
-    binance_symbols = get_binance_symbols()
-    bybit_symbols = get_bybit_symbols(binance_symbols)
+    symbols = get_symbols()
 
-    symbols = binance_symbols if binance_symbols else bybit_symbols
+    if not symbols:
+        print("No symbols found — exiting")
+        return
 
     state = load_json("state/rotation.json", {"index": 0})
 
