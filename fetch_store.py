@@ -38,7 +38,7 @@ s3 = boto3.client(
 BUCKET = os.getenv("R2_BUCKET")
 
 # =============================
-# JSON STATE HELPERS
+# JSON HELPERS
 # =============================
 
 def load_json(key, default):
@@ -52,9 +52,8 @@ def load_json(key, default):
 def save_json(key, data):
     s3.put_object(Bucket=BUCKET, Key=key, Body=json.dumps(data))
 
-
 # =============================
-# SYMBOL SYSTEM (FINAL FIX)
+# SYMBOL SYSTEM
 # =============================
 
 def fetch_symbols_from_api():
@@ -100,7 +99,6 @@ def get_symbols():
     if cache["symbols"]:
         return cache["symbols"]
 
-    # 🔥 FINAL FALLBACK (CRITICAL)
     print("⚠️ Using fallback symbols", flush=True)
 
     return [
@@ -146,7 +144,7 @@ def upload(df, path):
     file = "/tmp/temp.parquet"
     df.to_parquet(file, index=False, compression="snappy")
     s3.upload_file(file, BUCKET, path)
-    print(f"✅ {path}", flush=True)
+    print(f"✅ Uploaded: {path}", flush=True)
 
 # =============================
 # VALIDATION
@@ -161,7 +159,7 @@ def validate(df):
         return 0
 
 # =============================
-# BINANCE FETCH
+# BINANCE FETCH (FIXED)
 # =============================
 
 def fetch_binance(symbol, existing):
@@ -176,7 +174,8 @@ def fetch_binance(symbol, existing):
                 url = f"{BINANCE_BASE}/{symbol}/1h/{symbol}-1h-{year}-{str(month).zfill(2)}.zip"
 
                 res = retry_request(url)
-                if not res:
+
+                if not res or res.status_code != 200:
                     continue
 
                 try:
@@ -187,10 +186,11 @@ def fetch_binance(symbol, existing):
                     df = df[["time","open","high","low","close","volume"]]
                     df["time"] = pd.to_datetime(df["time"], unit="ms")
 
-                    all_df.append(df)
+                    if not df.empty:
+                        all_df.append(df)
 
-                except:
-                    continue
+                except Exception as e:
+                    print(f"Zip error {symbol}: {e}", flush=True)
 
     else:
         last_time = existing["time"].max()
@@ -201,7 +201,8 @@ def fetch_binance(symbol, existing):
         url = f"{BINANCE_BASE}/{symbol}/1h/{symbol}-1h-{year}-{month}.zip"
 
         res = retry_request(url)
-        if not res:
+
+        if not res or res.status_code != 200:
             return None
 
         try:
@@ -213,12 +214,21 @@ def fetch_binance(symbol, existing):
             df["time"] = pd.to_datetime(df["time"], unit="ms")
 
             df = df[df["time"] > last_time]
-            all_df.append(df)
 
-        except:
-            return None
+            if not df.empty:
+                all_df.append(df)
 
-    return pd.concat(all_df) if all_df else None
+        except Exception as e:
+            print(f"Incremental error {symbol}: {e}", flush=True)
+
+    if not all_df:
+        print(f"⚠️ No data found for {symbol}", flush=True)
+        return None
+
+    final_df = pd.concat(all_df)
+    print(f"✅ {symbol} fetched {len(final_df)} rows", flush=True)
+
+    return final_df
 
 # =============================
 # PROCESS
@@ -233,7 +243,7 @@ def process_symbol(symbol_obj):
 
         df = fetch_binance(sym, existing)
 
-        if df is not None:
+        if df is not None and not df.empty:
             if existing is not None:
                 df = pd.concat([existing, df])
 
