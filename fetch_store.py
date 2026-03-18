@@ -21,7 +21,6 @@ START_YEAR = 2023
 CURRENT_YEAR = int(time.strftime("%Y"))
 
 BINANCE_BASE = "https://data.binance.vision/data/futures/um/monthly/klines"
-BYBIT_API = "https://api.bybit.com/v5/market/tickers?category=linear"
 
 # =============================
 # R2 CLIENT
@@ -55,16 +54,43 @@ def save_json(key, data):
 # SYMBOL SYSTEM
 # =============================
 
-def fetch_symbols_from_api():
+def get_binance_symbols():
+    print("Fetching Binance symbols...", flush=True)
+
     try:
-        res = requests.get(BYBIT_API, timeout=10)
-        if res.status_code != 200:
-            return None
+        url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+        res = requests.get(url, timeout=10)
+        data = res.json()
+
+        usdt_pairs = [x for x in data if x["symbol"].endswith("USDT")]
+
+        sorted_data = sorted(
+            usdt_pairs,
+            key=lambda x: float(x["quoteVolume"]),
+            reverse=True
+        )
+
+        symbols = [{"symbol": x["symbol"]} for x in sorted_data[:300]]
+
+        print(f"✅ Binance symbols: {len(symbols)}", flush=True)
+
+        return symbols
+
+    except Exception as e:
+        print("❌ Binance API failed:", e)
+        return []
+
+
+def get_bybit_symbols(binance_symbols):
+    cache = load_json("state/bybit_symbols.json", {"symbols": []})
+
+    try:
+        print("Fetching Bybit symbols...", flush=True)
+
+        url = "https://api.bybit.com/v5/market/tickers?category=linear"
+        res = requests.get(url, timeout=10)
 
         data = res.json()
-        if "result" not in data:
-            return None
-
         symbols = data["result"]["list"]
 
         sorted_data = sorted(
@@ -73,45 +99,47 @@ def fetch_symbols_from_api():
             reverse=True
         )
 
-        return [{"symbol": x["symbol"]} for x in sorted_data[:300]]
+        top = [{"symbol": x["symbol"]} for x in sorted_data[:300]]
 
-    except:
-        return None
+        save_json("state/bybit_symbols.json", {"symbols": top})
 
+        print(f"✅ Bybit symbols: {len(top)}", flush=True)
 
-def get_symbols():
-    cache = load_json("state/top_symbols.json", {"date": "", "symbols": []})
-    today = datetime.utcnow().strftime("%Y-%m-%d")
+        return top
 
-    if cache["date"] != today:
-        print("Refreshing symbol list...", flush=True)
+    except Exception as e:
+        print("⚠️ Bybit API failed:", e, flush=True)
 
-        new_symbols = fetch_symbols_from_api()
+    fallback = cache["symbols"]
 
-        if new_symbols:
-            cache = {"date": today, "symbols": new_symbols}
-            save_json("state/top_symbols.json", cache)
-            print(f"✅ Cached {len(new_symbols)} symbols", flush=True)
-        else:
-            print("⚠️ API failed", flush=True)
+    if fallback:
+        print(f"Using cached Bybit symbols: {len(fallback)}", flush=True)
+    else:
+        print("No cached symbols, using base fallback", flush=True)
+        fallback = [
+            {"symbol": "BTCUSDT"},
+            {"symbol": "ETHUSDT"},
+            {"symbol": "SOLUSDT"},
+            {"symbol": "XRPUSDT"},
+        ]
 
-    if cache["symbols"]:
-        return cache["symbols"]
+    # 🔥 Fill from Binance
+    if len(fallback) < 300 and binance_symbols:
+        print("Filling missing symbols from Binance...", flush=True)
 
-    print("⚠️ Using fallback symbols", flush=True)
+        existing = set(x["symbol"] for x in fallback)
 
-    return [
-        {"symbol": "BTCUSDT"},
-        {"symbol": "ETHUSDT"},
-        {"symbol": "BNBUSDT"},
-        {"symbol": "SOLUSDT"},
-        {"symbol": "XRPUSDT"},
-        {"symbol": "ADAUSDT"},
-        {"symbol": "DOGEUSDT"},
-        {"symbol": "AVAXUSDT"},
-        {"symbol": "LINKUSDT"},
-        {"symbol": "MATICUSDT"}
-    ]
+        for coin in binance_symbols:
+            if coin["symbol"] not in existing:
+                fallback.append(coin)
+                existing.add(coin["symbol"])
+
+            if len(fallback) >= 300:
+                break
+
+    print(f"Final Bybit symbol count: {len(fallback)}", flush=True)
+
+    return fallback
 
 # =============================
 # RETRY
@@ -146,29 +174,15 @@ def upload(df, path):
     print(f"✅ Uploaded: {path}", flush=True)
 
 # =============================
-# VALIDATION
-# =============================
-
-def validate(df):
-    try:
-        expected = pd.date_range(df["time"].min(), df["time"].max(), freq="1H")
-        missing = len(expected) - len(df)
-        return round(100 - (missing / len(expected) * 100), 2)
-    except:
-        return 0
-
-# =============================
-# BINANCE FETCH (FINAL FIX)
+# CLEAN DATA (FIXED)
 # =============================
 
 def clean_dataframe(df):
     df.columns = ["time","open","high","low","close","volume","_","_","_","_","_","_"]
     df = df[["time","open","high","low","close","volume"]]
 
-    # remove header rows
     df = df[df["time"] != "open_time"]
 
-    # force numeric
     df["time"] = pd.to_numeric(df["time"], errors="coerce")
     df = df.dropna(subset=["time"])
 
@@ -179,6 +193,9 @@ def clean_dataframe(df):
 
     return df
 
+# =============================
+# FETCH BINANCE
+# =============================
 
 def fetch_binance(symbol, existing):
     all_df = []
@@ -226,7 +243,6 @@ def fetch_binance(symbol, existing):
                 df = pd.read_csv(z.open(z.namelist()[0]), header=None)
 
             df = clean_dataframe(df)
-
             df = df[df["time"] > last_time]
 
             if not df.empty:
@@ -263,9 +279,6 @@ def process_symbol(symbol_obj):
 
             df = df.drop_duplicates().sort_values("time")
 
-            score = validate(df)
-            print(f"{sym} Quality: {score}%", flush=True)
-
             upload(df, path)
 
     except Exception as e:
@@ -278,11 +291,11 @@ def process_symbol(symbol_obj):
 def main():
     print("🚀 FINAL PIPELINE STARTED", flush=True)
 
-    symbols = get_symbols()
+    binance_symbols = get_binance_symbols()
+    bybit_symbols = get_bybit_symbols(binance_symbols)
 
-    if not symbols:
-        print("No symbols available")
-        return
+    # 🔥 Using Binance for processing (stable)
+    symbols = binance_symbols if binance_symbols else bybit_symbols
 
     state = load_json("state/rotation.json", {"index": 0})
 
