@@ -4,6 +4,7 @@ import boto3
 import zipfile
 import time
 import json
+import requests
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor
 
@@ -11,13 +12,14 @@ from concurrent.futures import ThreadPoolExecutor
 # CONFIG
 # =============================
 
-CHUNK_SIZE = 20
-MAX_WORKERS = 5
+CHUNK_SIZE = 100   # 🔥 increased
+MAX_WORKERS = 10   # 🔥 increased for speed
 
 START_YEAR = 2023
 CURRENT_YEAR = int(time.strftime("%Y"))
 
 BINANCE_BASE = "https://data.binance.vision/data/futures/um/monthly/klines"
+BYBIT_API = "https://api.bybit.com/v5/market/kline"
 
 # =============================
 # R2 CLIENT
@@ -48,18 +50,11 @@ def save_json(key, data):
     s3.put_object(Bucket=BUCKET, Key=key, Body=json.dumps(data))
 
 # =============================
-# SYMBOL SOURCE (R2 ONLY)
+# SYMBOLS FROM R2
 # =============================
 
-def get_symbols():
-    data = load_json("state/binance_symbols.json", {"symbols": []})
-
-    if not data["symbols"]:
-        print("⚠️ No symbols found in R2", flush=True)
-        return []
-
-    print(f"✅ Loaded {len(data['symbols'])} symbols from R2", flush=True)
-
+def get_symbols(exchange):
+    data = load_json(f"state/{exchange}_symbols.json", {"symbols": []})
     return data["symbols"]
 
 # =============================
@@ -81,7 +76,7 @@ def upload(df, path):
     print(f"✅ Uploaded: {path}", flush=True)
 
 # =============================
-# CLEAN DATA (HEADER FIX)
+# CLEAN DATA
 # =============================
 
 def clean_dataframe(df):
@@ -101,14 +96,14 @@ def clean_dataframe(df):
     return df
 
 # =============================
-# FETCH BINANCE DATA
+# BINANCE FETCH
 # =============================
 
 def fetch_binance(symbol, existing):
     all_df = []
 
     if existing is None:
-        print(f"Backfilling {symbol}", flush=True)
+        print(f"Backfilling Binance {symbol}", flush=True)
 
         for year in range(START_YEAR, CURRENT_YEAR + 1):
             for month in range(1, 13):
@@ -116,9 +111,7 @@ def fetch_binance(symbol, existing):
                 url = f"{BINANCE_BASE}/{symbol}/1h/{symbol}-1h-{year}-{str(month).zfill(2)}.zip"
 
                 try:
-                    import requests
                     res = requests.get(url, timeout=10)
-
                     if res.status_code != 200:
                         continue
 
@@ -142,9 +135,7 @@ def fetch_binance(symbol, existing):
         url = f"{BINANCE_BASE}/{symbol}/1h/{symbol}-1h-{year}-{month}.zip"
 
         try:
-            import requests
             res = requests.get(url, timeout=10)
-
             if res.status_code != 200:
                 return None
 
@@ -160,65 +151,108 @@ def fetch_binance(symbol, existing):
         except:
             return None
 
-    if not all_df:
+    return pd.concat(all_df) if all_df else None
+
+# =============================
+# BYBIT FETCH (INCREMENTAL)
+# =============================
+
+def fetch_bybit(symbol, existing):
+    try:
+        params = {
+            "category": "linear",
+            "symbol": symbol,
+            "interval": "60",
+            "limit": 200
+        }
+
+        res = requests.get(BYBIT_API, params=params, timeout=10)
+
+        data = res.json()
+
+        if "result" not in data:
+            return None
+
+        candles = data["result"]["list"]
+
+        df = pd.DataFrame(candles)
+        df.columns = ["time","open","high","low","close","volume","turnover"]
+
+        df["time"] = pd.to_datetime(df["time"].astype(int), unit="ms")
+
+        for col in ["open","high","low","close","volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        if existing is not None:
+            last_time = existing["time"].max()
+            df = df[df["time"] > last_time]
+
+        return df if not df.empty else None
+
+    except:
         return None
 
-    final_df = pd.concat(all_df)
-    print(f"✅ {symbol} fetched {len(final_df)} rows", flush=True)
-
-    return final_df
-
 # =============================
-# PROCESS SYMBOL
+# PROCESS FUNCTIONS
 # =============================
 
-def process_symbol(symbol_obj):
+def process_binance(symbol_obj):
     sym = symbol_obj["symbol"]
 
-    try:
-        path = f"binance/futures/1h/{sym}.parquet"
-        existing = get_existing(path)
+    path = f"binance/futures/1h/{sym}.parquet"
+    existing = get_existing(path)
 
-        df = fetch_binance(sym, existing)
+    df = fetch_binance(sym, existing)
 
-        if df is not None and not df.empty:
-            if existing is not None:
-                df = pd.concat([existing, df])
+    if df is not None:
+        if existing is not None:
+            df = pd.concat([existing, df])
 
-            df = df.drop_duplicates().sort_values("time")
+        df = df.drop_duplicates().sort_values("time")
+        upload(df, path)
 
-            upload(df, path)
 
-    except Exception as e:
-        print(f"Error {sym}: {e}", flush=True)
+def process_bybit(symbol_obj):
+    sym = symbol_obj["symbol"]
+
+    path = f"bybit/futures/1h/{sym}.parquet"
+    existing = get_existing(path)
+
+    df = fetch_bybit(sym, existing)
+
+    if df is not None:
+        if existing is not None:
+            df = pd.concat([existing, df])
+
+        df = df.drop_duplicates().sort_values("time")
+        upload(df, path)
 
 # =============================
 # MAIN
 # =============================
 
 def main():
-    print("🚀 GITHUB PIPELINE STARTED", flush=True)
+    print("🚀 FULL PIPELINE STARTED", flush=True)
 
-    symbols = get_symbols()
-
-    if not symbols:
-        print("No symbols found — exiting")
-        return
+    binance_symbols = get_symbols("binance")
+    bybit_symbols = get_symbols("bybit")
 
     state = load_json("state/rotation.json", {"index": 0})
 
     start = state["index"]
     end = start + CHUNK_SIZE
 
-    selected = symbols[start:end]
+    b_sel = binance_symbols[start:end]
+    y_sel = bybit_symbols[start:end]
 
-    state["index"] = 0 if end >= len(symbols) else end
+    state["index"] = 0 if end >= len(binance_symbols) else end
     save_json("state/rotation.json", state)
 
     print(f"Processing {start} → {end}", flush=True)
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        executor.map(process_symbol, selected)
+        executor.map(process_binance, b_sel)
+        executor.map(process_bybit, y_sel)
 
     print("✅ DONE", flush=True)
 
