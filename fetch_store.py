@@ -25,7 +25,7 @@ BINANCE_BASE = "https://data.binance.vision/data/futures/um/monthly/klines"
 BYBIT_API = "https://api.bybit.com/v5/market/kline"
 
 # =============================
-# R2 CLIENT
+# R2
 # =============================
 
 s3 = boto3.client(
@@ -94,7 +94,6 @@ def clean_dataframe(df):
 def fetch_binance(symbol, tf, existing):
     all_df = []
 
-    # BACKFILL
     if existing is None:
         for year in range(START_YEAR, CURRENT_YEAR + 1):
             for month in range(1, 13):
@@ -116,7 +115,6 @@ def fetch_binance(symbol, tf, existing):
                 except:
                     continue
 
-    # INCREMENTAL
     else:
         year = time.strftime("%Y")
         month = time.strftime("%m")
@@ -134,8 +132,6 @@ def fetch_binance(symbol, tf, existing):
             df = clean_dataframe(df)
 
             last_time = existing["time"].max()
-
-            # 🔥 STRICT FILTER
             df = df[df["time"] > last_time]
 
             if df.empty:
@@ -149,31 +145,53 @@ def fetch_binance(symbol, tf, existing):
     return pd.concat(all_df) if all_df else None
 
 # =============================
-# BYBIT FETCH
+# BYBIT FETCH (FIXED)
 # =============================
 
 def fetch_bybit(symbol, tf, existing):
     try:
-        params = {
-            "category": "linear",
-            "symbol": symbol,
-            "interval": tf,
-            "limit": 200
-        }
+        all_data = []
+        end_time = int(time.time() * 1000)
 
-        res = requests.get(BYBIT_API, params=params, timeout=10)
-        data = res.json()
+        # 🔥 fetch multiple pages (important)
+        for _ in range(3):  # 3 batches = ~600 candles
+            params = {
+                "category": "linear",
+                "symbol": symbol,
+                "interval": tf,
+                "limit": 200,
+                "end": end_time
+            }
 
-        if "result" not in data:
-            return None
+            res = requests.get(BYBIT_API, params=params, timeout=10)
 
-        df = pd.DataFrame(data["result"]["list"])
-        df.columns = ["time","open","high","low","close","volume","turnover"]
+            if res.status_code != 200:
+                return None
 
-        df["time"] = pd.to_datetime(df["time"].astype(int), unit="ms")
+            data = res.json()
 
-        for col in ["open","high","low","close","volume"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+            if "result" not in data or not data["result"]["list"]:
+                return None
+
+            candles = data["result"]["list"]
+
+            df = pd.DataFrame(candles)
+            df.columns = ["time","open","high","low","close","volume","turnover"]
+
+            # 🔥 FIX: reverse order (bybit gives latest first)
+            df = df.iloc[::-1]
+
+            df["time"] = pd.to_datetime(df["time"].astype(int), unit="ms")
+
+            for col in ["open","high","low","close","volume"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+            all_data.append(df)
+
+            # move pagination
+            end_time = int(df["time"].iloc[0].timestamp() * 1000)
+
+        df = pd.concat(all_data)
 
         if existing is not None:
             last_time = existing["time"].max()
@@ -234,11 +252,11 @@ def process_bybit_symbol(symbol):
         upload(df, path)
 
 # =============================
-# MAIN (FIXED ROTATION)
+# MAIN
 # =============================
 
 def main():
-    print("🚀 FINAL STABLE PIPELINE", flush=True)
+    print("🚀 FINAL PIPELINE (BINANCE + BYBIT FIXED)", flush=True)
 
     binance_symbols = load_json("state/binance_symbols.json", {"symbols": []})["symbols"]
     bybit_symbols = load_json("state/bybit_symbols.json", {"symbols": []})["symbols"]
@@ -251,12 +269,7 @@ def main():
     b_sel = binance_symbols[start:end]
     y_sel = bybit_symbols[start:end]
 
-    # 🔥 FIXED ROTATION
-    if end >= len(binance_symbols):
-        state["index"] = 0
-    else:
-        state["index"] = end
-
+    state["index"] = 0 if end >= len(binance_symbols) else end
     save_json("state/rotation.json", state)
 
     print(f"Processing {start} → {end}", flush=True)
