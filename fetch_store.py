@@ -25,7 +25,7 @@ BINANCE_BASE = "https://data.binance.vision/data/futures/um/monthly/klines"
 BYBIT_API = "https://api.bybit.com/v5/market/kline"
 
 # =============================
-# R2
+# R2 CLIENT
 # =============================
 
 s3 = boto3.client(
@@ -94,10 +94,10 @@ def clean_dataframe(df):
 def fetch_binance(symbol, tf, existing):
     all_df = []
 
+    # BACKFILL
     if existing is None:
         for year in range(START_YEAR, CURRENT_YEAR + 1):
             for month in range(1, 13):
-
                 url = f"{BINANCE_BASE}/{symbol}/{tf}/{symbol}-{tf}-{year}-{str(month).zfill(2)}.zip"
 
                 try:
@@ -116,6 +116,7 @@ def fetch_binance(symbol, tf, existing):
                 except:
                     continue
 
+    # INCREMENTAL
     else:
         year = time.strftime("%Y")
         month = time.strftime("%m")
@@ -133,10 +134,14 @@ def fetch_binance(symbol, tf, existing):
             df = clean_dataframe(df)
 
             last_time = existing["time"].max()
+
+            # 🔥 STRICT FILTER
             df = df[df["time"] > last_time]
 
-            if not df.empty:
-                all_df.append(df)
+            if df.empty:
+                return None
+
+            all_df.append(df)
 
         except:
             return None
@@ -174,69 +179,91 @@ def fetch_bybit(symbol, tf, existing):
             last_time = existing["time"].max()
             df = df[df["time"] > last_time]
 
-        return df if not df.empty else None
+            if df.empty:
+                return None
+
+        return df
 
     except:
         return None
 
 # =============================
-# PROCESS
+# PROCESS BINANCE
 # =============================
 
-def process_symbol(symbol):
+def process_binance_symbol(symbol):
     sym = symbol["symbol"]
 
-    # BINANCE
     for tf in TIMEFRAMES_BINANCE:
         path = f"binance/futures/{tf}/{sym}.parquet"
         existing = get_existing(path)
 
         df = fetch_binance(sym, tf, existing)
 
-        if df is not None:
-            if existing is not None:
-                df = pd.concat([existing, df])
+        if df is None:
+            print(f"⏭️ Skip Binance {sym} {tf}", flush=True)
+            continue
 
-            df = df.drop_duplicates().sort_values("time")
-            upload(df, path)
+        if existing is not None:
+            df = pd.concat([existing, df])
 
-    # BYBIT
+        df = df.drop_duplicates().sort_values("time")
+        upload(df, path)
+
+# =============================
+# PROCESS BYBIT
+# =============================
+
+def process_bybit_symbol(symbol):
+    sym = symbol["symbol"]
+
     for tf in TIMEFRAMES_BYBIT:
         path = f"bybit/futures/{tf}/{sym}.parquet"
         existing = get_existing(path)
 
         df = fetch_bybit(sym, tf, existing)
 
-        if df is not None:
-            if existing is not None:
-                df = pd.concat([existing, df])
+        if df is None:
+            print(f"⏭️ Skip Bybit {sym} {tf}", flush=True)
+            continue
 
-            df = df.drop_duplicates().sort_values("time")
-            upload(df, path)
+        if existing is not None:
+            df = pd.concat([existing, df])
+
+        df = df.drop_duplicates().sort_values("time")
+        upload(df, path)
 
 # =============================
-# MAIN
+# MAIN (FIXED ROTATION)
 # =============================
 
 def main():
-    print("🚀 FULL MULTI-TF PIPELINE", flush=True)
+    print("🚀 FINAL STABLE PIPELINE", flush=True)
 
-    symbols = load_json("state/binance_symbols.json", {"symbols": []})["symbols"]
+    binance_symbols = load_json("state/binance_symbols.json", {"symbols": []})["symbols"]
+    bybit_symbols = load_json("state/bybit_symbols.json", {"symbols": []})["symbols"]
 
     state = load_json("state/rotation.json", {"index": 0})
 
     start = state["index"]
     end = start + CHUNK_SIZE
 
-    selected = symbols[start:end]
+    b_sel = binance_symbols[start:end]
+    y_sel = bybit_symbols[start:end]
 
-    state["index"] = 0 if end >= len(symbols) else end
+    # 🔥 FIXED ROTATION
+    if end >= len(binance_symbols):
+        state["index"] = 0
+    else:
+        state["index"] = end
+
     save_json("state/rotation.json", state)
 
     print(f"Processing {start} → {end}", flush=True)
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        executor.map(process_symbol, selected)
+        executor.map(process_binance_symbol, b_sel)
+        executor.map(process_bybit_symbol, y_sel)
 
     print("✅ DONE", flush=True)
 
