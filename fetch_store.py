@@ -51,7 +51,7 @@ def save_json(key, data):
     s3.put_object(Bucket=BUCKET, Key=key, Body=json.dumps(data))
 
 # =============================
-# SYMBOL SYSTEM
+# SYMBOL SYSTEM (FINAL FIX)
 # =============================
 
 def get_binance_symbols():
@@ -60,13 +60,21 @@ def get_binance_symbols():
     try:
         url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
         res = requests.get(url, timeout=10)
+
+        if res.status_code != 200:
+            raise Exception(f"HTTP {res.status_code}")
+
         data = res.json()
 
-        usdt_pairs = [x for x in data if x["symbol"].endswith("USDT")]
+        if not isinstance(data, list):
+            print("⚠️ Binance returned error:", data)
+            return []
+
+        usdt_pairs = [x for x in data if x.get("symbol", "").endswith("USDT")]
 
         sorted_data = sorted(
             usdt_pairs,
-            key=lambda x: float(x["quoteVolume"]),
+            key=lambda x: float(x.get("quoteVolume", 0)),
             reverse=True
         )
 
@@ -77,7 +85,7 @@ def get_binance_symbols():
         return symbols
 
     except Exception as e:
-        print("❌ Binance API failed:", e)
+        print("❌ Binance API failed:", e, flush=True)
         return []
 
 
@@ -90,7 +98,17 @@ def get_bybit_symbols(binance_symbols):
         url = "https://api.bybit.com/v5/market/tickers?category=linear"
         res = requests.get(url, timeout=10)
 
-        data = res.json()
+        if res.status_code != 200:
+            raise Exception(f"HTTP {res.status_code}")
+
+        try:
+            data = res.json()
+        except:
+            raise Exception("Invalid JSON response")
+
+        if "result" not in data or "list" not in data["result"]:
+            raise Exception("Unexpected API format")
+
         symbols = data["result"]["list"]
 
         sorted_data = sorted(
@@ -110,6 +128,7 @@ def get_bybit_symbols(binance_symbols):
     except Exception as e:
         print("⚠️ Bybit API failed:", e, flush=True)
 
+    # fallback
     fallback = cache["symbols"]
 
     if fallback:
@@ -123,7 +142,7 @@ def get_bybit_symbols(binance_symbols):
             {"symbol": "XRPUSDT"},
         ]
 
-    # 🔥 Fill from Binance
+    # fill from binance
     if len(fallback) < 300 and binance_symbols:
         print("Filling missing symbols from Binance...", flush=True)
 
@@ -132,7 +151,6 @@ def get_bybit_symbols(binance_symbols):
         for coin in binance_symbols:
             if coin["symbol"] not in existing:
                 fallback.append(coin)
-                existing.add(coin["symbol"])
 
             if len(fallback) >= 300:
                 break
@@ -174,7 +192,7 @@ def upload(df, path):
     print(f"✅ Uploaded: {path}", flush=True)
 
 # =============================
-# CLEAN DATA (FIXED)
+# CLEAN DATA (HEADER FIX)
 # =============================
 
 def clean_dataframe(df):
@@ -294,7 +312,6 @@ def main():
     binance_symbols = get_binance_symbols()
     bybit_symbols = get_bybit_symbols(binance_symbols)
 
-    # 🔥 Using Binance for processing (stable)
     symbols = binance_symbols if binance_symbols else bybit_symbols
 
     state = load_json("state/rotation.json", {"index": 0})
