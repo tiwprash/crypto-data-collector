@@ -13,7 +13,6 @@ from concurrent.futures import ThreadPoolExecutor
 # CONFIG
 # =============================
 
-TIMEFRAMES = ["1h"]
 CHUNK_SIZE = 20
 MAX_WORKERS = 5
 RETRIES = 3
@@ -159,8 +158,27 @@ def validate(df):
         return 0
 
 # =============================
-# BINANCE FETCH (FIXED)
+# BINANCE FETCH (FINAL FIX)
 # =============================
+
+def clean_dataframe(df):
+    df.columns = ["time","open","high","low","close","volume","_","_","_","_","_","_"]
+    df = df[["time","open","high","low","close","volume"]]
+
+    # remove header rows
+    df = df[df["time"] != "open_time"]
+
+    # force numeric
+    df["time"] = pd.to_numeric(df["time"], errors="coerce")
+    df = df.dropna(subset=["time"])
+
+    df["time"] = pd.to_datetime(df["time"], unit="ms")
+
+    for col in ["open","high","low","close","volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df
+
 
 def fetch_binance(symbol, existing):
     all_df = []
@@ -182,9 +200,7 @@ def fetch_binance(symbol, existing):
                     with zipfile.ZipFile(BytesIO(res.content)) as z:
                         df = pd.read_csv(z.open(z.namelist()[0]), header=None)
 
-                    df.columns = ["time","open","high","low","close","volume","_","_","_","_","_","_"]
-                    df = df[["time","open","high","low","close","volume"]]
-                    df["time"] = pd.to_datetime(df["time"], unit="ms")
+                    df = clean_dataframe(df)
 
                     if not df.empty:
                         all_df.append(df)
@@ -209,9 +225,7 @@ def fetch_binance(symbol, existing):
             with zipfile.ZipFile(BytesIO(res.content)) as z:
                 df = pd.read_csv(z.open(z.namelist()[0]), header=None)
 
-            df.columns = ["time","open","high","low","close","volume","_","_","_","_","_","_"]
-            df = df[["time","open","high","low","close","volume"]]
-            df["time"] = pd.to_datetime(df["time"], unit="ms")
+            df = clean_dataframe(df)
 
             df = df[df["time"] > last_time]
 
