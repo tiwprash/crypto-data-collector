@@ -6,6 +6,7 @@ import zipfile
 import time
 import json
 from io import BytesIO
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
 # =============================
@@ -17,11 +18,11 @@ CHUNK_SIZE = 20
 MAX_WORKERS = 5
 RETRIES = 3
 
-BINANCE_BASE = "https://data.binance.vision/data/futures/um/monthly/klines"
-BYBIT_BASE = "https://api.bybit.com/v5/market/kline"
-
 START_YEAR = 2023
 CURRENT_YEAR = int(time.strftime("%Y"))
+
+BINANCE_BASE = "https://data.binance.vision/data/futures/um/monthly/klines"
+BYBIT_API = "https://api.bybit.com/v5/market/tickers?category=linear"
 
 # =============================
 # R2 CLIENT
@@ -37,34 +38,88 @@ s3 = boto3.client(
 BUCKET = os.getenv("R2_BUCKET")
 
 # =============================
-# STATE
+# STATE MANAGEMENT
 # =============================
 
-def load_state():
+def load_json(key, default):
     try:
-        obj = s3.get_object(Bucket=BUCKET, Key="state/rotation.json")
+        obj = s3.get_object(Bucket=BUCKET, Key=key)
         return json.loads(obj["Body"].read())
     except:
-        return {"index": 0}
+        return default
 
 
-def save_state(state):
-    s3.put_object(Bucket=BUCKET, Key="state/rotation.json", Body=json.dumps(state))
+def save_json(key, data):
+    s3.put_object(Bucket=BUCKET, Key=key, Body=json.dumps(data))
+
 
 # =============================
-# HELPERS
+# SYMBOL CACHE SYSTEM
 # =============================
 
-def retry_request(url, params=None):
+def fetch_symbols_from_api():
+    try:
+        res = requests.get(BYBIT_API, timeout=10)
+        if res.status_code != 200:
+            return None
+
+        data = res.json()
+        if "result" not in data:
+            return None
+
+        symbols = data["result"]["list"]
+
+        sorted_data = sorted(
+            symbols,
+            key=lambda x: float(x.get("turnover24h", 0)),
+            reverse=True
+        )
+
+        return [{"symbol": x["symbol"]} for x in sorted_data[:300]]
+
+    except:
+        return None
+
+
+def get_symbols():
+    cache = load_json("state/top_symbols.json", {"date": "", "symbols": []})
+
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+
+    # 🔥 refresh once per day
+    if cache["date"] != today:
+        print("Refreshing symbol list...", flush=True)
+
+        new_symbols = fetch_symbols_from_api()
+
+        if new_symbols:
+            cache = {"date": today, "symbols": new_symbols}
+            save_json("state/top_symbols.json", cache)
+            print("Symbols updated", flush=True)
+        else:
+            print("⚠️ API failed, using old symbols", flush=True)
+
+    return cache["symbols"]
+
+
+# =============================
+# RETRY
+# =============================
+
+def retry_request(url):
     for _ in range(RETRIES):
         try:
-            res = requests.get(url, params=params, timeout=10)
+            res = requests.get(url, timeout=10)
             if res.status_code == 200:
                 return res
         except:
             time.sleep(1)
     return None
 
+
+# =============================
+# DATA HELPERS
+# =============================
 
 def get_existing(path):
     try:
@@ -76,57 +131,24 @@ def get_existing(path):
 
 def upload(df, path):
     file = "/tmp/temp.parquet"
-
-    # 🔥 compression
     df.to_parquet(file, index=False, compression="snappy")
-
     s3.upload_file(file, BUCKET, path)
     print(f"✅ {path}", flush=True)
+
 
 # =============================
 # VALIDATION
 # =============================
 
-def validate_data(df, interval):
+def validate(df, interval):
     try:
-        freq_map = {
-            "1m": "1min",
-            "5m": "5min",
-            "15m": "15min",
-            "1h": "1H",
-            "4h": "4H",
-            "1d": "1D"
-        }
-
-        expected = pd.date_range(
-            start=df["time"].min(),
-            end=df["time"].max(),
-            freq=freq_map[interval]
-        )
-
+        freq_map = {"1h": "1H"}
+        expected = pd.date_range(df["time"].min(), df["time"].max(), freq=freq_map[interval])
         missing = len(expected) - len(df)
-
-        score = max(0, 100 - (missing / len(expected) * 100))
-
-        return round(score, 2)
-
+        return round(100 - (missing / len(expected) * 100), 2)
     except:
         return 0
 
-# =============================
-# SYMBOLS
-# =============================
-
-def get_top_bybit():
-    res = retry_request("https://api.bybit.com/v5/market/tickers?category=linear")
-    if not res:
-        return []
-
-    data = res.json()
-    if "result" not in data:
-        return []
-
-    return sorted(data["result"]["list"], key=lambda x: float(x["turnover24h"]), reverse=True)[:300]
 
 # =============================
 # BINANCE FETCH
@@ -135,7 +157,6 @@ def get_top_bybit():
 def fetch_binance(symbol, interval, existing):
     all_df = []
 
-    # BACKFILL
     if existing is None:
         print(f"Backfilling {symbol}", flush=True)
 
@@ -160,7 +181,6 @@ def fetch_binance(symbol, interval, existing):
                 except:
                     continue
 
-    # INCREMENTAL
     else:
         last_time = existing["time"].max()
 
@@ -182,50 +202,13 @@ def fetch_binance(symbol, interval, existing):
             df["time"] = pd.to_datetime(df["time"], unit="ms")
 
             df = df[df["time"] > last_time]
-
             all_df.append(df)
 
         except:
             return None
 
-    if not all_df:
-        return None
+    return pd.concat(all_df) if all_df else None
 
-    return pd.concat(all_df)
-
-# =============================
-# BYBIT FETCH
-# =============================
-
-def fetch_bybit(symbol, interval, existing):
-    params = {
-        "category": "linear",
-        "symbol": symbol,
-        "interval": interval,
-        "limit": 200
-    }
-
-    res = retry_request(BYBIT_BASE, params)
-    if not res:
-        return None
-
-    data = res.json()
-    if "result" not in data:
-        return None
-
-    candles = data["result"]["list"]
-    if not candles:
-        return None
-
-    df = pd.DataFrame(candles)
-    df.columns = ["time","open","high","low","close","volume","turnover"]
-    df["time"] = pd.to_datetime(df["time"].astype(int), unit="ms")
-
-    if existing is not None:
-        last_time = existing["time"].max()
-        df = df[df["time"] > last_time]
-
-    return df if not df.empty else None
 
 # =============================
 # PROCESS
@@ -235,63 +218,48 @@ def process_symbol(symbol_obj, interval):
     sym = symbol_obj["symbol"]
 
     try:
-        # -------- BINANCE --------
-        path_b = f"binance/futures/{interval}/{sym}.parquet"
-        existing_b = get_existing(path_b)
+        path = f"binance/futures/{interval}/{sym}.parquet"
+        existing = get_existing(path)
 
-        df_b = fetch_binance(sym, interval, existing_b)
+        df = fetch_binance(sym, interval, existing)
 
-        if df_b is not None:
-            if existing_b is not None:
-                df_b = pd.concat([existing_b, df_b])
+        if df is not None:
+            if existing is not None:
+                df = pd.concat([existing, df])
 
-            df_b = df_b.drop_duplicates().sort_values("time")
+            df = df.drop_duplicates().sort_values("time")
 
-            score = validate_data(df_b, interval)
-            print(f"{sym} Binance Quality: {score}%", flush=True)
+            score = validate(df, interval)
+            print(f"{sym} Quality: {score}%", flush=True)
 
-            upload(df_b, path_b)
-
-        # -------- BYBIT --------
-        path_y = f"bybit/futures/{interval}/{sym}.parquet"
-        existing_y = get_existing(path_y)
-
-        df_y = fetch_bybit(sym, interval, existing_y)
-
-        if df_y is not None:
-            if existing_y is not None:
-                df_y = pd.concat([existing_y, df_y])
-
-            df_y = df_y.drop_duplicates().sort_values("time")
-
-            score = validate_data(df_y, interval)
-            print(f"{sym} Bybit Quality: {score}%", flush=True)
-
-            upload(df_y, path_y)
+            upload(df, path)
 
     except Exception as e:
         print(f"Error {sym}: {e}", flush=True)
+
 
 # =============================
 # MAIN
 # =============================
 
 def main():
-    print("🚀 ULTIMATE PIPELINE STARTED", flush=True)
+    print("🚀 FINAL PIPELINE STARTED", flush=True)
 
-    symbols = get_top_bybit()
+    symbols = get_symbols()
+
     if not symbols:
-        print("No symbols")
+        print("No symbols available")
         return
 
-    state = load_state()
+    state = load_json("state/rotation.json", {"index": 0})
+
     start = state["index"]
     end = start + CHUNK_SIZE
 
     selected = symbols[start:end]
 
     state["index"] = 0 if end >= len(symbols) else end
-    save_state(state)
+    save_json("state/rotation.json", state)
 
     print(f"Processing {start} → {end}", flush=True)
 
