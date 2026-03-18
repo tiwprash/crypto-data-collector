@@ -15,14 +15,13 @@ from concurrent.futures import ThreadPoolExecutor
 CHUNK_SIZE = 50
 MAX_WORKERS = 10
 
-TIMEFRAMES_BINANCE = ["1m","5m","15m","30m","1h","4h","1d","1w"]
-TIMEFRAMES_BYBIT = ["1","5","15","30","60","240","D","W"]
+TIMEFRAMES = ["1m","5m","15m","30m","1h","4h","1d","1w"]
 
 START_YEAR = 2023
 CURRENT_YEAR = int(time.strftime("%Y"))
+CURRENT_MONTH = int(time.strftime("%m"))
 
 BINANCE_BASE = "https://data.binance.vision/data/futures/um/monthly/klines"
-BYBIT_API = "https://api.bybit.com/v5/market/kline"
 
 # =============================
 # R2
@@ -88,15 +87,21 @@ def clean_dataframe(df):
     return df
 
 # =============================
-# BINANCE FETCH
+# SMART FETCH (INCREMENTAL)
 # =============================
 
 def fetch_binance(symbol, tf, existing):
     all_df = []
 
+    # =============================
+    # BACKFILL (FIRST TIME)
+    # =============================
     if existing is None:
+        print(f"Backfill {symbol} {tf}", flush=True)
+
         for year in range(START_YEAR, CURRENT_YEAR + 1):
             for month in range(1, 13):
+
                 url = f"{BINANCE_BASE}/{symbol}/{tf}/{symbol}-{tf}-{year}-{str(month).zfill(2)}.zip"
 
                 try:
@@ -115,134 +120,63 @@ def fetch_binance(symbol, tf, existing):
                 except:
                     continue
 
+    # =============================
+    # TRUE INCREMENTAL
+    # =============================
     else:
-        year = time.strftime("%Y")
-        month = time.strftime("%m")
+        last_time = existing["time"].max()
 
-        url = f"{BINANCE_BASE}/{symbol}/{tf}/{symbol}-{tf}-{year}-{month}.zip"
+        last_year = last_time.year
+        last_month = last_time.month
 
-        try:
-            res = requests.get(url, timeout=10)
-            if res.status_code != 200:
-                return None
-
-            with zipfile.ZipFile(BytesIO(res.content)) as z:
-                df = pd.read_csv(z.open(z.namelist()[0]), header=None)
-
-            df = clean_dataframe(df)
-
-            last_time = existing["time"].max()
-            df = df[df["time"] > last_time]
-
-            if df.empty:
-                return None
-
-            all_df.append(df)
-
-        except:
+        # 🔥 If already current month → skip
+        if last_year == CURRENT_YEAR and last_month == CURRENT_MONTH:
+            print(f"⏭️ Up-to-date {symbol} {tf}", flush=True)
             return None
+
+        # only fetch missing months
+        for year in range(last_year, CURRENT_YEAR + 1):
+            start_month = last_month if year == last_year else 1
+            end_month = CURRENT_MONTH if year == CURRENT_YEAR else 12
+
+            for month in range(start_month, end_month + 1):
+
+                url = f"{BINANCE_BASE}/{symbol}/{tf}/{symbol}-{tf}-{year}-{str(month).zfill(2)}.zip"
+
+                try:
+                    res = requests.get(url, timeout=10)
+                    if res.status_code != 200:
+                        continue
+
+                    with zipfile.ZipFile(BytesIO(res.content)) as z:
+                        df = pd.read_csv(z.open(z.namelist()[0]), header=None)
+
+                    df = clean_dataframe(df)
+
+                    df = df[df["time"] > last_time]
+
+                    if not df.empty:
+                        all_df.append(df)
+
+                except:
+                    continue
 
     return pd.concat(all_df) if all_df else None
 
 # =============================
-# BYBIT FETCH (FIXED)
+# PROCESS
 # =============================
 
-def fetch_bybit(symbol, tf, existing):
-    try:
-        all_data = []
-        end_time = int(time.time() * 1000)
-
-        # 🔥 fetch multiple pages (important)
-        for _ in range(3):  # 3 batches = ~600 candles
-            params = {
-                "category": "linear",
-                "symbol": symbol,
-                "interval": tf,
-                "limit": 200,
-                "end": end_time
-            }
-
-            res = requests.get(BYBIT_API, params=params, timeout=10)
-
-            if res.status_code != 200:
-                return None
-
-            data = res.json()
-
-            if "result" not in data or not data["result"]["list"]:
-                return None
-
-            candles = data["result"]["list"]
-
-            df = pd.DataFrame(candles)
-            df.columns = ["time","open","high","low","close","volume","turnover"]
-
-            # 🔥 FIX: reverse order (bybit gives latest first)
-            df = df.iloc[::-1]
-
-            df["time"] = pd.to_datetime(df["time"].astype(int), unit="ms")
-
-            for col in ["open","high","low","close","volume"]:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-
-            all_data.append(df)
-
-            # move pagination
-            end_time = int(df["time"].iloc[0].timestamp() * 1000)
-
-        df = pd.concat(all_data)
-
-        if existing is not None:
-            last_time = existing["time"].max()
-            df = df[df["time"] > last_time]
-
-            if df.empty:
-                return None
-
-        return df
-
-    except:
-        return None
-
-# =============================
-# PROCESS BINANCE
-# =============================
-
-def process_binance_symbol(symbol):
+def process_symbol(symbol):
     sym = symbol["symbol"]
 
-    for tf in TIMEFRAMES_BINANCE:
+    for tf in TIMEFRAMES:
         path = f"binance/futures/{tf}/{sym}.parquet"
         existing = get_existing(path)
 
         df = fetch_binance(sym, tf, existing)
 
         if df is None:
-            print(f"⏭️ Skip Binance {sym} {tf}", flush=True)
-            continue
-
-        if existing is not None:
-            df = pd.concat([existing, df])
-
-        df = df.drop_duplicates().sort_values("time")
-        upload(df, path)
-
-# =============================
-# PROCESS BYBIT
-# =============================
-
-def process_bybit_symbol(symbol):
-    sym = symbol["symbol"]
-
-    for tf in TIMEFRAMES_BYBIT:
-        path = f"bybit/futures/{tf}/{sym}.parquet"
-        existing = get_existing(path)
-
-        df = fetch_bybit(sym, tf, existing)
-
-        if df is None:
-            print(f"⏭️ Skip Bybit {sym} {tf}", flush=True)
             continue
 
         if existing is not None:
@@ -256,27 +190,24 @@ def process_bybit_symbol(symbol):
 # =============================
 
 def main():
-    print("🚀 FINAL PIPELINE (BINANCE + BYBIT FIXED)", flush=True)
+    print("🚀 BINANCE ONLY PIPELINE", flush=True)
 
-    binance_symbols = load_json("state/binance_symbols.json", {"symbols": []})["symbols"]
-    bybit_symbols = load_json("state/bybit_symbols.json", {"symbols": []})["symbols"]
+    symbols = load_json("state/binance_symbols.json", {"symbols": []})["symbols"]
 
     state = load_json("state/rotation.json", {"index": 0})
 
     start = state["index"]
     end = start + CHUNK_SIZE
 
-    b_sel = binance_symbols[start:end]
-    y_sel = bybit_symbols[start:end]
+    selected = symbols[start:end]
 
-    state["index"] = 0 if end >= len(binance_symbols) else end
+    state["index"] = 0 if end >= len(symbols) else end
     save_json("state/rotation.json", state)
 
     print(f"Processing {start} → {end}", flush=True)
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        executor.map(process_binance_symbol, b_sel)
-        executor.map(process_bybit_symbol, y_sel)
+        executor.map(process_symbol, selected)
 
     print("✅ DONE", flush=True)
 
