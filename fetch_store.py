@@ -4,6 +4,7 @@ import pandas as pd
 import boto3
 import zipfile
 import time
+import json
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor
 
@@ -11,15 +12,19 @@ from concurrent.futures import ThreadPoolExecutor
 # CONFIG
 # =============================
 
-INTERVAL = "1h"
-CHUNK_SIZE = 30
-MAX_WORKERS = 5   # 🔥 parallel threads
+TIMEFRAMES = ["1h"]
+CHUNK_SIZE = 20
+MAX_WORKERS = 5
+RETRIES = 3
 
 BINANCE_BASE = "https://data.binance.vision/data/futures/um/monthly/klines"
 BYBIT_BASE = "https://api.bybit.com/v5/market/kline"
 
+START_YEAR = 2023
+CURRENT_YEAR = int(time.strftime("%Y"))
+
 # =============================
-# R2
+# R2 CLIENT
 # =============================
 
 s3 = boto3.client(
@@ -32,8 +37,34 @@ s3 = boto3.client(
 BUCKET = os.getenv("R2_BUCKET")
 
 # =============================
+# STATE
+# =============================
+
+def load_state():
+    try:
+        obj = s3.get_object(Bucket=BUCKET, Key="state/rotation.json")
+        return json.loads(obj["Body"].read())
+    except:
+        return {"index": 0}
+
+
+def save_state(state):
+    s3.put_object(Bucket=BUCKET, Key="state/rotation.json", Body=json.dumps(state))
+
+# =============================
 # HELPERS
 # =============================
+
+def retry_request(url, params=None):
+    for _ in range(RETRIES):
+        try:
+            res = requests.get(url, params=params, timeout=10)
+            if res.status_code == 200:
+                return res
+        except:
+            time.sleep(1)
+    return None
+
 
 def get_existing(path):
     try:
@@ -45,146 +76,228 @@ def get_existing(path):
 
 def upload(df, path):
     file = "/tmp/temp.parquet"
-    df.to_parquet(file, index=False)
+
+    # 🔥 compression
+    df.to_parquet(file, index=False, compression="snappy")
+
     s3.upload_file(file, BUCKET, path)
     print(f"✅ {path}", flush=True)
 
+# =============================
+# VALIDATION
+# =============================
+
+def validate_data(df, interval):
+    try:
+        freq_map = {
+            "1m": "1min",
+            "5m": "5min",
+            "15m": "15min",
+            "1h": "1H",
+            "4h": "4H",
+            "1d": "1D"
+        }
+
+        expected = pd.date_range(
+            start=df["time"].min(),
+            end=df["time"].max(),
+            freq=freq_map[interval]
+        )
+
+        missing = len(expected) - len(df)
+
+        score = max(0, 100 - (missing / len(expected) * 100))
+
+        return round(score, 2)
+
+    except:
+        return 0
 
 # =============================
 # SYMBOLS
 # =============================
 
 def get_top_bybit():
-    data = requests.get("https://api.bybit.com/v5/market/tickers?category=linear").json()["result"]["list"]
-    return sorted(data, key=lambda x: float(x["turnover24h"]), reverse=True)[:300]
+    res = retry_request("https://api.bybit.com/v5/market/tickers?category=linear")
+    if not res:
+        return []
 
+    data = res.json()
+    if "result" not in data:
+        return []
 
-def get_top_binance():
-    data = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr").json()
-    return sorted(data, key=lambda x: float(x["quoteVolume"]), reverse=True)[:300]
-
+    return sorted(data["result"]["list"], key=lambda x: float(x["turnover24h"]), reverse=True)[:300]
 
 # =============================
-# BINANCE INCREMENTAL (DUMP)
+# BINANCE FETCH
 # =============================
 
-def process_binance(symbol):
-    sym = symbol["symbol"]
-    path = f"binance/futures/{INTERVAL}/{sym}.parquet"
+def fetch_binance(symbol, interval, existing):
+    all_df = []
 
-    print(f"Binance {sym}", flush=True)
+    # BACKFILL
+    if existing is None:
+        print(f"Backfilling {symbol}", flush=True)
 
-    existing = get_existing(path)
-    last_time = existing["time"].max() if existing is not None else None
+        for year in range(START_YEAR, CURRENT_YEAR + 1):
+            for month in range(1, 13):
+                url = f"{BINANCE_BASE}/{symbol}/{interval}/{symbol}-{interval}-{year}-{str(month).zfill(2)}.zip"
 
-    # 🔥 only latest month
-    month = time.strftime("%m")
-    year = time.strftime("%Y")
+                res = retry_request(url)
+                if not res:
+                    continue
 
-    url = f"{BINANCE_BASE}/{sym}/{INTERVAL}/{sym}-{INTERVAL}-{year}-{month}.zip"
+                try:
+                    with zipfile.ZipFile(BytesIO(res.content)) as z:
+                        df = pd.read_csv(z.open(z.namelist()[0]), header=None)
 
-    try:
-        res = requests.get(url)
-        if res.status_code != 200:
-            return
+                    df.columns = ["time","open","high","low","close","volume","_","_","_","_","_","_"]
+                    df = df[["time","open","high","low","close","volume"]]
+                    df["time"] = pd.to_datetime(df["time"], unit="ms")
 
-        with zipfile.ZipFile(BytesIO(res.content)) as z:
-            df = pd.read_csv(z.open(z.namelist()[0]), header=None)
+                    all_df.append(df)
 
-        df.columns = [
-            "time","open","high","low","close","volume",
-            "_","_","_","_","_","_"
-        ]
+                except:
+                    continue
 
-        df = df[["time","open","high","low","close","volume"]]
-        df["time"] = pd.to_datetime(df["time"], unit="ms")
+    # INCREMENTAL
+    else:
+        last_time = existing["time"].max()
 
-        if last_time is not None:
+        year = time.strftime("%Y")
+        month = time.strftime("%m")
+
+        url = f"{BINANCE_BASE}/{symbol}/{interval}/{symbol}-{interval}-{year}-{month}.zip"
+
+        res = retry_request(url)
+        if not res:
+            return None
+
+        try:
+            with zipfile.ZipFile(BytesIO(res.content)) as z:
+                df = pd.read_csv(z.open(z.namelist()[0]), header=None)
+
+            df.columns = ["time","open","high","low","close","volume","_","_","_","_","_","_"]
+            df = df[["time","open","high","low","close","volume"]]
+            df["time"] = pd.to_datetime(df["time"], unit="ms")
+
             df = df[df["time"] > last_time]
 
-        if df.empty:
-            return
+            all_df.append(df)
 
-        if existing is not None:
-            df = pd.concat([existing, df])
+        except:
+            return None
 
-        df = df.drop_duplicates().sort_values("time")
+    if not all_df:
+        return None
 
-        upload(df, path)
-
-    except Exception as e:
-        print(f"Binance error {sym}: {e}", flush=True)
-
+    return pd.concat(all_df)
 
 # =============================
-# BYBIT INCREMENTAL
+# BYBIT FETCH
 # =============================
 
-def process_bybit(symbol):
-    sym = symbol["symbol"]
-    path = f"bybit/futures/{INTERVAL}/{sym}.parquet"
+def fetch_bybit(symbol, interval, existing):
+    params = {
+        "category": "linear",
+        "symbol": symbol,
+        "interval": interval,
+        "limit": 200
+    }
 
-    print(f"Bybit {sym}", flush=True)
+    res = retry_request(BYBIT_BASE, params)
+    if not res:
+        return None
 
-    existing = get_existing(path)
-    last_time = existing["time"].max() if existing is not None else None
+    data = res.json()
+    if "result" not in data:
+        return None
+
+    candles = data["result"]["list"]
+    if not candles:
+        return None
+
+    df = pd.DataFrame(candles)
+    df.columns = ["time","open","high","low","close","volume","turnover"]
+    df["time"] = pd.to_datetime(df["time"].astype(int), unit="ms")
+
+    if existing is not None:
+        last_time = existing["time"].max()
+        df = df[df["time"] > last_time]
+
+    return df if not df.empty else None
+
+# =============================
+# PROCESS
+# =============================
+
+def process_symbol(symbol_obj, interval):
+    sym = symbol_obj["symbol"]
 
     try:
-        params = {
-            "category": "linear",
-            "symbol": sym,
-            "interval": INTERVAL,
-            "limit": 200
-        }
+        # -------- BINANCE --------
+        path_b = f"binance/futures/{interval}/{sym}.parquet"
+        existing_b = get_existing(path_b)
 
-        res = requests.get(BYBIT_BASE, params=params).json()
+        df_b = fetch_binance(sym, interval, existing_b)
 
-        if "result" not in res:
-            return
+        if df_b is not None:
+            if existing_b is not None:
+                df_b = pd.concat([existing_b, df_b])
 
-        data = res["result"]["list"]
-        if not data:
-            return
+            df_b = df_b.drop_duplicates().sort_values("time")
 
-        df = pd.DataFrame(data)
-        df.columns = ["time","open","high","low","close","volume","turnover"]
+            score = validate_data(df_b, interval)
+            print(f"{sym} Binance Quality: {score}%", flush=True)
 
-        df["time"] = pd.to_datetime(df["time"].astype(int), unit="ms")
+            upload(df_b, path_b)
 
-        if last_time is not None:
-            df = df[df["time"] > last_time]
+        # -------- BYBIT --------
+        path_y = f"bybit/futures/{interval}/{sym}.parquet"
+        existing_y = get_existing(path_y)
 
-        if df.empty:
-            return
+        df_y = fetch_bybit(sym, interval, existing_y)
 
-        if existing is not None:
-            df = pd.concat([existing, df])
+        if df_y is not None:
+            if existing_y is not None:
+                df_y = pd.concat([existing_y, df_y])
 
-        df = df.drop_duplicates().sort_values("time")
+            df_y = df_y.drop_duplicates().sort_values("time")
 
-        upload(df, path)
+            score = validate_data(df_y, interval)
+            print(f"{sym} Bybit Quality: {score}%", flush=True)
+
+            upload(df_y, path_y)
 
     except Exception as e:
-        print(f"Bybit error {sym}: {e}", flush=True)
-
+        print(f"Error {sym}: {e}", flush=True)
 
 # =============================
-# MAIN (PARALLEL)
+# MAIN
 # =============================
 
 def main():
-    print("⚡ PARALLEL PIPELINE STARTED", flush=True)
+    print("🚀 ULTIMATE PIPELINE STARTED", flush=True)
 
-    binance = get_top_binance()[:CHUNK_SIZE]
-    bybit = get_top_bybit()[:CHUNK_SIZE]
+    symbols = get_top_bybit()
+    if not symbols:
+        print("No symbols")
+        return
+
+    state = load_state()
+    start = state["index"]
+    end = start + CHUNK_SIZE
+
+    selected = symbols[start:end]
+
+    state["index"] = 0 if end >= len(symbols) else end
+    save_state(state)
+
+    print(f"Processing {start} → {end}", flush=True)
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-
-        # Binance parallel
-        executor.map(process_binance, binance)
-
-        # Bybit parallel
-        executor.map(process_bybit, bybit)
+        for tf in TIMEFRAMES:
+            executor.map(lambda s: process_symbol(s, tf), selected)
 
     print("✅ DONE", flush=True)
 
