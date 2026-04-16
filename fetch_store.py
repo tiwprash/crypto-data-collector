@@ -16,7 +16,7 @@ from botocore.config import Config
 
 CHUNK_SIZE = 50
 MAX_WORKERS = 5
-UPLOAD_CHUNK_ROWS = 100000   # 🔥 prevents large upload failure
+UPLOAD_CHUNK_ROWS = 100000
 
 TIMEFRAMES = ["1m","5m","15m","30m","1h","4h","1d","1w"]
 
@@ -90,7 +90,7 @@ def get_existing(path):
         return None
 
 # =============================
-# SAFE CHUNKED UPLOAD
+# FIXED CHUNKED UPLOAD
 # =============================
 
 def upload(df, base_path):
@@ -104,6 +104,10 @@ def upload(df, base_path):
 
         if chunk_df.empty:
             continue
+
+        # 🔥 FIX: convert timestamp → epoch milliseconds
+        chunk_df = chunk_df.copy()
+        chunk_df["time"] = chunk_df["time"].astype("int64") // 10**6
 
         path = base_path.replace(".json.gz", f"_part{i}.json.gz")
 
@@ -121,7 +125,6 @@ def upload(df, base_path):
 
             print(f"📡 {path} → {response['ResponseMetadata']['HTTPStatusCode']}", flush=True)
 
-            # verify
             s3.head_object(Bucket=BUCKET, Key=path)
             print(f"✅ Verified {path}", flush=True)
 
@@ -205,7 +208,7 @@ def process_symbol(symbol):
             continue
 
         if existing is not None and not existing.empty:
-            existing["time"] = pd.to_datetime(existing["time"])
+            existing["time"] = pd.to_datetime(existing["time"], unit="ms")
             df = pd.concat([existing, df])
 
         cutoff = pd.Timestamp.now() - pd.DateOffset(years=2)
@@ -220,7 +223,7 @@ def process_symbol(symbol):
 # =============================
 
 def main():
-    print("🚀 FINAL PIPELINE", flush=True)
+    print("🚀 FINAL PIPELINE (WORKING)", flush=True)
 
     symbols = load_json("state/binance_symbols.json", {"symbols": []})["symbols"]
 
