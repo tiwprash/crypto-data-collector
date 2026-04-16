@@ -14,15 +14,14 @@ from concurrent.futures import ThreadPoolExecutor
 # =============================
 
 CHUNK_SIZE = 50
-MAX_WORKERS = 10
+MAX_WORKERS = 5   # 🔥 safer
 
 TIMEFRAMES = ["1m","5m","15m","30m","1h","4h","1d","1w"]
 
 CURRENT_YEAR = int(time.strftime("%Y"))
 CURRENT_MONTH = int(time.strftime("%m"))
 
-# 🔥 ONLY LAST 2 YEARS
-START_YEAR = CURRENT_YEAR - 1
+START_YEAR = CURRENT_YEAR - 1  # last 2 yrs
 
 BINANCE_BASE = "https://data.binance.vision/data/futures/um/monthly/klines"
 
@@ -55,19 +54,18 @@ def save_json(key, data):
     s3.put_object(Bucket=BUCKET, Key=key, Body=json.dumps(data))
 
 
-# 🔥 READ GZIP JSON
 def get_existing(path):
     try:
         obj = s3.get_object(Bucket=BUCKET, Key=path)
-        compressed = obj["Body"].read()
-        decompressed = gzip.decompress(compressed)
+        decompressed = gzip.decompress(obj["Body"].read())
         return pd.DataFrame(json.loads(decompressed))
     except:
         return None
 
 
-# 🔥 WRITE GZIP JSON
 def upload(df, path):
+    print(f"⬆️ Uploading {path} | rows={len(df)}", flush=True)
+
     json_data = df.to_dict(orient="records")
     compressed = gzip.compress(json.dumps(json_data).encode("utf-8"))
 
@@ -79,7 +77,7 @@ def upload(df, path):
         ContentEncoding="gzip"
     )
 
-    print(f"✅ {path}", flush=True)
+    print(f"✅ Uploaded {path}", flush=True)
 
 # =============================
 # CLEAN
@@ -102,74 +100,48 @@ def clean_dataframe(df):
     return df
 
 # =============================
-# FETCH
+# FETCH (FIXED)
 # =============================
 
-def fetch_binance(symbol, tf, existing):
+def fetch_binance(symbol, tf):
     all_df = []
+    success_count = 0
 
-    if existing is None:
-        print(f"Backfill {symbol} {tf}", flush=True)
+    print(f"📥 Fetching {symbol} {tf}", flush=True)
 
-        for year in range(START_YEAR, CURRENT_YEAR + 1):
-            for month in range(1, 13):
+    for year in range(START_YEAR, CURRENT_YEAR + 1):
+        for month in range(1, 13):
 
-                url = f"{BINANCE_BASE}/{symbol}/{tf}/{symbol}-{tf}-{year}-{str(month).zfill(2)}.zip"
+            if year == CURRENT_YEAR and month > CURRENT_MONTH:
+                continue
 
-                try:
-                    res = requests.get(url, timeout=10)
-                    if res.status_code != 200:
-                        continue
+            url = f"{BINANCE_BASE}/{symbol}/{tf}/{symbol}-{tf}-{year}-{str(month).zfill(2)}.zip"
 
-                    with zipfile.ZipFile(BytesIO(res.content)) as z:
-                        df = pd.read_csv(z.open(z.namelist()[0]), header=None)
+            try:
+                res = requests.get(url, timeout=10)
 
-                    df = clean_dataframe(df)
-
-                    if not df.empty:
-                        all_df.append(df)
-
-                except:
+                if res.status_code != 200:
                     continue
 
-    else:
-        existing["time"] = pd.to_datetime(existing["time"])
-        last_time = existing["time"].max()
+                with zipfile.ZipFile(BytesIO(res.content)) as z:
+                    df = pd.read_csv(z.open(z.namelist()[0]), header=None)
 
-        last_year = last_time.year
-        last_month = last_time.month
+                df = clean_dataframe(df)
 
-        if last_year == CURRENT_YEAR and last_month == CURRENT_MONTH:
-            print(f"⏭️ Up-to-date {symbol} {tf}", flush=True)
-            return None
+                if not df.empty:
+                    all_df.append(df)
+                    success_count += 1
 
-        for year in range(last_year, CURRENT_YEAR + 1):
-            start_month = last_month if year == last_year else 1
-            end_month = CURRENT_MONTH if year == CURRENT_YEAR else 12
+            except Exception as e:
+                continue
 
-            for month in range(start_month, end_month + 1):
+    if not all_df:
+        print(f"❌ No data at all for {symbol} {tf}", flush=True)
+        return None
 
-                url = f"{BINANCE_BASE}/{symbol}/{tf}/{symbol}-{tf}-{year}-{str(month).zfill(2)}.zip"
+    print(f"✅ {symbol} {tf} months fetched: {success_count}", flush=True)
 
-                try:
-                    res = requests.get(url, timeout=10)
-                    if res.status_code != 200:
-                        continue
-
-                    with zipfile.ZipFile(BytesIO(res.content)) as z:
-                        df = pd.read_csv(z.open(z.namelist()[0]), header=None)
-
-                    df = clean_dataframe(df)
-
-                    df = df[df["time"] > last_time]
-
-                    if not df.empty:
-                        all_df.append(df)
-
-                except:
-                    continue
-
-    return pd.concat(all_df) if all_df else None
+    return pd.concat(all_df)
 
 # =============================
 # PROCESS
@@ -179,16 +151,23 @@ def process_symbol(symbol):
     sym = symbol["symbol"]
 
     for tf in TIMEFRAMES:
-        path = f"binance/futures/{tf}/{sym}.json.gz"  # 🔥 gzip extension
+        path = f"binance/futures/{tf}/{sym}.json.gz"
+
         existing = get_existing(path)
 
-        df = fetch_binance(sym, tf, existing)
+        df = fetch_binance(sym, tf)
 
-        if df is None:
+        if df is None or df.empty:
             continue
 
-        if existing is not None:
+        # merge existing
+        if existing is not None and not existing.empty:
+            existing["time"] = pd.to_datetime(existing["time"])
             df = pd.concat([existing, df])
+
+        # keep only last 2 yrs
+        cutoff = pd.Timestamp.now() - pd.DateOffset(years=2)
+        df = df[df["time"] >= cutoff]
 
         df = df.drop_duplicates().sort_values("time")
 
@@ -199,7 +178,7 @@ def process_symbol(symbol):
 # =============================
 
 def main():
-    print("🚀 BINANCE GZIP JSON PIPELINE", flush=True)
+    print("🚀 BINANCE PIPELINE (FIXED)", flush=True)
 
     symbols = load_json("state/binance_symbols.json", {"symbols": []})["symbols"]
 
