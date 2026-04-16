@@ -14,29 +14,41 @@ from concurrent.futures import ThreadPoolExecutor
 # =============================
 
 CHUNK_SIZE = 50
-MAX_WORKERS = 5   # 🔥 safer
+MAX_WORKERS = 5
 
 TIMEFRAMES = ["1m","5m","15m","30m","1h","4h","1d","1w"]
 
 CURRENT_YEAR = int(time.strftime("%Y"))
 CURRENT_MONTH = int(time.strftime("%m"))
 
-START_YEAR = CURRENT_YEAR - 1  # last 2 yrs
+START_YEAR = CURRENT_YEAR - 1
 
 BINANCE_BASE = "https://data.binance.vision/data/futures/um/monthly/klines"
 
 # =============================
-# R2
+# R2 CONFIG
 # =============================
+
+R2_ENDPOINT = os.getenv("R2_ENDPOINT")
+R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY")
+R2_SECRET_KEY = os.getenv("R2_SECRET_KEY")
+BUCKET = os.getenv("R2_BUCKET")
 
 s3 = boto3.client(
     "s3",
-    endpoint_url=os.getenv("R2_ENDPOINT"),
-    aws_access_key_id=os.getenv("R2_ACCESS_KEY"),
-    aws_secret_access_key=os.getenv("R2_SECRET_KEY"),
+    endpoint_url=R2_ENDPOINT,
+    aws_access_key_id=R2_ACCESS_KEY,
+    aws_secret_access_key=R2_SECRET_KEY,
 )
 
-BUCKET = os.getenv("R2_BUCKET")
+# =============================
+# DEBUG ENV
+# =============================
+
+print("🔍 DEBUG ENV", flush=True)
+print("BUCKET:", BUCKET, flush=True)
+print("ENDPOINT:", R2_ENDPOINT, flush=True)
+print("ACCESS KEY PREFIX:", str(R2_ACCESS_KEY)[:5], flush=True)
 
 # =============================
 # HELPERS
@@ -63,21 +75,39 @@ def get_existing(path):
         return None
 
 
+# =============================
+# UPLOAD (WITH VERIFICATION)
+# =============================
+
 def upload(df, path):
     print(f"⬆️ Uploading {path} | rows={len(df)}", flush=True)
 
     json_data = df.to_dict(orient="records")
     compressed = gzip.compress(json.dumps(json_data).encode("utf-8"))
 
-    s3.put_object(
-        Bucket=BUCKET,
-        Key=path,
-        Body=compressed,
-        ContentType="application/json",
-        ContentEncoding="gzip"
-    )
+    try:
+        s3.put_object(
+            Bucket=BUCKET,
+            Key=path,
+            Body=compressed,
+            ContentType="application/json",
+            ContentEncoding="gzip"
+        )
 
-    print(f"✅ Uploaded {path}", flush=True)
+        # ✅ VERIFY
+        s3.head_object(Bucket=BUCKET, Key=path)
+        print(f"✅ Verified upload: {path}", flush=True)
+
+    except Exception as e:
+        print(f"❌ Upload FAILED: {path} | Error: {e}", flush=True)
+
+    # 🔥 LIST OBJECTS (PROOF)
+    try:
+        resp = s3.list_objects_v2(Bucket=BUCKET, MaxKeys=3)
+        print("📦 Sample objects in bucket:", [x["Key"] for x in resp.get("Contents", [])], flush=True)
+    except Exception as e:
+        print("❌ List failed:", e, flush=True)
+
 
 # =============================
 # CLEAN
@@ -99,8 +129,9 @@ def clean_dataframe(df):
 
     return df
 
+
 # =============================
-# FETCH (FIXED)
+# FETCH
 # =============================
 
 def fetch_binance(symbol, tf):
@@ -132,16 +163,17 @@ def fetch_binance(symbol, tf):
                     all_df.append(df)
                     success_count += 1
 
-            except Exception as e:
+            except:
                 continue
 
     if not all_df:
-        print(f"❌ No data at all for {symbol} {tf}", flush=True)
+        print(f"❌ No data for {symbol} {tf}", flush=True)
         return None
 
     print(f"✅ {symbol} {tf} months fetched: {success_count}", flush=True)
 
     return pd.concat(all_df)
+
 
 # =============================
 # PROCESS
@@ -160,12 +192,10 @@ def process_symbol(symbol):
         if df is None or df.empty:
             continue
 
-        # merge existing
         if existing is not None and not existing.empty:
             existing["time"] = pd.to_datetime(existing["time"])
             df = pd.concat([existing, df])
 
-        # keep only last 2 yrs
         cutoff = pd.Timestamp.now() - pd.DateOffset(years=2)
         df = df[df["time"] >= cutoff]
 
@@ -173,12 +203,13 @@ def process_symbol(symbol):
 
         upload(df, path)
 
+
 # =============================
 # MAIN
 # =============================
 
 def main():
-    print("🚀 BINANCE PIPELINE (FIXED)", flush=True)
+    print("🚀 BINANCE PIPELINE FINAL DEBUG", flush=True)
 
     symbols = load_json("state/binance_symbols.json", {"symbols": []})["symbols"]
 
