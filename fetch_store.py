@@ -17,9 +17,11 @@ MAX_WORKERS = 10
 
 TIMEFRAMES = ["1m","5m","15m","30m","1h","4h","1d","1w"]
 
-START_YEAR = 2023
 CURRENT_YEAR = int(time.strftime("%Y"))
 CURRENT_MONTH = int(time.strftime("%m"))
+
+# 🔥 ONLY LAST 2 YEARS
+START_YEAR = CURRENT_YEAR - 1
 
 BINANCE_BASE = "https://data.binance.vision/data/futures/um/monthly/klines"
 
@@ -55,15 +57,19 @@ def save_json(key, data):
 def get_existing(path):
     try:
         obj = s3.get_object(Bucket=BUCKET, Key=path)
-        return pd.read_parquet(BytesIO(obj["Body"].read()))
+        return pd.DataFrame(json.loads(obj["Body"].read()))
     except:
         return None
 
 
+# 🔥 UPDATED: upload as JSON
 def upload(df, path):
-    file = "/tmp/temp.parquet"
-    df.to_parquet(file, index=False, compression="snappy")
-    s3.upload_file(file, BUCKET, path)
+    json_data = df.to_dict(orient="records")
+    s3.put_object(
+        Bucket=BUCKET,
+        Key=path,
+        Body=json.dumps(json_data)
+    )
     print(f"✅ {path}", flush=True)
 
 # =============================
@@ -87,15 +93,12 @@ def clean_dataframe(df):
     return df
 
 # =============================
-# SMART FETCH (INCREMENTAL)
+# FETCH
 # =============================
 
 def fetch_binance(symbol, tf, existing):
     all_df = []
 
-    # =============================
-    # BACKFILL (FIRST TIME)
-    # =============================
     if existing is None:
         print(f"Backfill {symbol} {tf}", flush=True)
 
@@ -120,21 +123,16 @@ def fetch_binance(symbol, tf, existing):
                 except:
                     continue
 
-    # =============================
-    # TRUE INCREMENTAL
-    # =============================
     else:
-        last_time = existing["time"].max()
+        last_time = pd.to_datetime(existing["time"]).max()
 
         last_year = last_time.year
         last_month = last_time.month
 
-        # 🔥 If already current month → skip
         if last_year == CURRENT_YEAR and last_month == CURRENT_MONTH:
             print(f"⏭️ Up-to-date {symbol} {tf}", flush=True)
             return None
 
-        # only fetch missing months
         for year in range(last_year, CURRENT_YEAR + 1):
             start_month = last_month if year == last_year else 1
             end_month = CURRENT_MONTH if year == CURRENT_YEAR else 12
@@ -171,7 +169,7 @@ def process_symbol(symbol):
     sym = symbol["symbol"]
 
     for tf in TIMEFRAMES:
-        path = f"binance/futures/{tf}/{sym}.parquet"
+        path = f"binance/futures/{tf}/{sym}.json"  # 🔥 changed extension
         existing = get_existing(path)
 
         df = fetch_binance(sym, tf, existing)
@@ -180,9 +178,11 @@ def process_symbol(symbol):
             continue
 
         if existing is not None:
+            existing["time"] = pd.to_datetime(existing["time"])
             df = pd.concat([existing, df])
 
         df = df.drop_duplicates().sort_values("time")
+
         upload(df, path)
 
 # =============================
@@ -190,7 +190,7 @@ def process_symbol(symbol):
 # =============================
 
 def main():
-    print("🚀 BINANCE ONLY PIPELINE", flush=True)
+    print("🚀 BINANCE JSON PIPELINE", flush=True)
 
     symbols = load_json("state/binance_symbols.json", {"symbols": []})["symbols"]
 
