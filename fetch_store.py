@@ -5,6 +5,7 @@ import zipfile
 import time
 import json
 import requests
+import gzip
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor
 
@@ -54,22 +55,30 @@ def save_json(key, data):
     s3.put_object(Bucket=BUCKET, Key=key, Body=json.dumps(data))
 
 
+# 🔥 READ GZIP JSON
 def get_existing(path):
     try:
         obj = s3.get_object(Bucket=BUCKET, Key=path)
-        return pd.DataFrame(json.loads(obj["Body"].read()))
+        compressed = obj["Body"].read()
+        decompressed = gzip.decompress(compressed)
+        return pd.DataFrame(json.loads(decompressed))
     except:
         return None
 
 
-# 🔥 UPDATED: upload as JSON
+# 🔥 WRITE GZIP JSON
 def upload(df, path):
     json_data = df.to_dict(orient="records")
+    compressed = gzip.compress(json.dumps(json_data).encode("utf-8"))
+
     s3.put_object(
         Bucket=BUCKET,
         Key=path,
-        Body=json.dumps(json_data)
+        Body=compressed,
+        ContentType="application/json",
+        ContentEncoding="gzip"
     )
+
     print(f"✅ {path}", flush=True)
 
 # =============================
@@ -124,7 +133,8 @@ def fetch_binance(symbol, tf, existing):
                     continue
 
     else:
-        last_time = pd.to_datetime(existing["time"]).max()
+        existing["time"] = pd.to_datetime(existing["time"])
+        last_time = existing["time"].max()
 
         last_year = last_time.year
         last_month = last_time.month
@@ -169,7 +179,7 @@ def process_symbol(symbol):
     sym = symbol["symbol"]
 
     for tf in TIMEFRAMES:
-        path = f"binance/futures/{tf}/{sym}.json"  # 🔥 changed extension
+        path = f"binance/futures/{tf}/{sym}.json.gz"  # 🔥 gzip extension
         existing = get_existing(path)
 
         df = fetch_binance(sym, tf, existing)
@@ -178,7 +188,6 @@ def process_symbol(symbol):
             continue
 
         if existing is not None:
-            existing["time"] = pd.to_datetime(existing["time"])
             df = pd.concat([existing, df])
 
         df = df.drop_duplicates().sort_values("time")
@@ -190,7 +199,7 @@ def process_symbol(symbol):
 # =============================
 
 def main():
-    print("🚀 BINANCE JSON PIPELINE", flush=True)
+    print("🚀 BINANCE GZIP JSON PIPELINE", flush=True)
 
     symbols = load_json("state/binance_symbols.json", {"symbols": []})["symbols"]
 
