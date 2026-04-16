@@ -8,6 +8,7 @@ import requests
 import gzip
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor
+from botocore.config import Config
 
 # =============================
 # CONFIG
@@ -15,12 +16,12 @@ from concurrent.futures import ThreadPoolExecutor
 
 CHUNK_SIZE = 50
 MAX_WORKERS = 5
+UPLOAD_CHUNK_ROWS = 100000   # 🔥 prevents large upload failure
 
 TIMEFRAMES = ["1m","5m","15m","30m","1h","4h","1d","1w"]
 
 CURRENT_YEAR = int(time.strftime("%Y"))
 CURRENT_MONTH = int(time.strftime("%m"))
-
 START_YEAR = CURRENT_YEAR - 1
 
 BINANCE_BASE = "https://data.binance.vision/data/futures/um/monthly/klines"
@@ -39,16 +40,30 @@ s3 = boto3.client(
     endpoint_url=R2_ENDPOINT,
     aws_access_key_id=R2_ACCESS_KEY,
     aws_secret_access_key=R2_SECRET_KEY,
+    config=Config(
+        retries={"max_attempts": 3, "mode": "standard"},
+        connect_timeout=10,
+        read_timeout=60,
+    )
 )
-
-# =============================
-# DEBUG ENV
-# =============================
 
 print("🔍 DEBUG ENV", flush=True)
 print("BUCKET:", BUCKET, flush=True)
 print("ENDPOINT:", R2_ENDPOINT, flush=True)
-print("ACCESS KEY PREFIX:", str(R2_ACCESS_KEY)[:5], flush=True)
+
+# =============================
+# TEST UPLOAD
+# =============================
+
+def test_upload():
+    print("🧪 Testing R2 upload...", flush=True)
+    try:
+        s3.put_object(Bucket=BUCKET, Key="test_file.txt", Body=b"hello")
+        s3.head_object(Bucket=BUCKET, Key="test_file.txt")
+        print("✅ TEST UPLOAD SUCCESS", flush=True)
+    except Exception as e:
+        print("❌ TEST UPLOAD FAILED", flush=True)
+        print(e, flush=True)
 
 # =============================
 # HELPERS
@@ -74,40 +89,45 @@ def get_existing(path):
     except:
         return None
 
-
 # =============================
-# UPLOAD (WITH VERIFICATION)
+# SAFE CHUNKED UPLOAD
 # =============================
 
-def upload(df, path):
-    print(f"⬆️ Uploading {path} | rows={len(df)}", flush=True)
+def upload(df, base_path):
+    total_rows = len(df)
+    chunks = (total_rows // UPLOAD_CHUNK_ROWS) + 1
 
-    json_data = df.to_dict(orient="records")
-    compressed = gzip.compress(json.dumps(json_data).encode("utf-8"))
+    print(f"⬆️ Uploading {base_path} in {chunks} chunks", flush=True)
 
-    try:
-        s3.put_object(
-            Bucket=BUCKET,
-            Key=path,
-            Body=compressed,
-            ContentType="application/json",
-            ContentEncoding="gzip"
-        )
+    for i in range(chunks):
+        chunk_df = df.iloc[i*UPLOAD_CHUNK_ROWS:(i+1)*UPLOAD_CHUNK_ROWS]
 
-        # ✅ VERIFY
-        s3.head_object(Bucket=BUCKET, Key=path)
-        print(f"✅ Verified upload: {path}", flush=True)
+        if chunk_df.empty:
+            continue
 
-    except Exception as e:
-        print(f"❌ Upload FAILED: {path} | Error: {e}", flush=True)
+        path = base_path.replace(".json.gz", f"_part{i}.json.gz")
 
-    # 🔥 LIST OBJECTS (PROOF)
-    try:
-        resp = s3.list_objects_v2(Bucket=BUCKET, MaxKeys=3)
-        print("📦 Sample objects in bucket:", [x["Key"] for x in resp.get("Contents", [])], flush=True)
-    except Exception as e:
-        print("❌ List failed:", e, flush=True)
+        try:
+            json_data = chunk_df.to_dict(orient="records")
+            compressed = gzip.compress(json.dumps(json_data).encode("utf-8"))
 
+            response = s3.put_object(
+                Bucket=BUCKET,
+                Key=path,
+                Body=compressed,
+                ContentType="application/json",
+                ContentEncoding="gzip"
+            )
+
+            print(f"📡 {path} → {response['ResponseMetadata']['HTTPStatusCode']}", flush=True)
+
+            # verify
+            s3.head_object(Bucket=BUCKET, Key=path)
+            print(f"✅ Verified {path}", flush=True)
+
+        except Exception as e:
+            print(f"❌ FAILED {path}", flush=True)
+            print(e, flush=True)
 
 # =============================
 # CLEAN
@@ -121,7 +141,6 @@ def clean_dataframe(df):
 
     df["time"] = pd.to_numeric(df["time"], errors="coerce")
     df = df.dropna(subset=["time"])
-
     df["time"] = pd.to_datetime(df["time"], unit="ms")
 
     for col in ["open","high","low","close","volume"]:
@@ -129,15 +148,12 @@ def clean_dataframe(df):
 
     return df
 
-
 # =============================
 # FETCH
 # =============================
 
 def fetch_binance(symbol, tf):
     all_df = []
-    success_count = 0
-
     print(f"📥 Fetching {symbol} {tf}", flush=True)
 
     for year in range(START_YEAR, CURRENT_YEAR + 1):
@@ -161,19 +177,15 @@ def fetch_binance(symbol, tf):
 
                 if not df.empty:
                     all_df.append(df)
-                    success_count += 1
 
             except:
                 continue
 
     if not all_df:
-        print(f"❌ No data for {symbol} {tf}", flush=True)
+        print(f"❌ No data {symbol} {tf}", flush=True)
         return None
 
-    print(f"✅ {symbol} {tf} months fetched: {success_count}", flush=True)
-
     return pd.concat(all_df)
-
 
 # =============================
 # PROCESS
@@ -183,9 +195,9 @@ def process_symbol(symbol):
     sym = symbol["symbol"]
 
     for tf in TIMEFRAMES:
-        path = f"binance/futures/{tf}/{sym}.json.gz"
+        base_path = f"binance/futures/{tf}/{sym}.json.gz"
 
-        existing = get_existing(path)
+        existing = get_existing(base_path)
 
         df = fetch_binance(sym, tf)
 
@@ -201,15 +213,14 @@ def process_symbol(symbol):
 
         df = df.drop_duplicates().sort_values("time")
 
-        upload(df, path)
-
+        upload(df, base_path)
 
 # =============================
 # MAIN
 # =============================
 
 def main():
-    print("🚀 BINANCE PIPELINE FINAL DEBUG", flush=True)
+    print("🚀 FINAL PIPELINE", flush=True)
 
     symbols = load_json("state/binance_symbols.json", {"symbols": []})["symbols"]
 
@@ -232,4 +243,5 @@ def main():
 
 
 if __name__ == "__main__":
+    test_upload()
     main()
