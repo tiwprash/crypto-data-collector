@@ -58,7 +58,6 @@ def get_binance():
     try:
         data = requests.get(url, timeout=10).json()
         
-        # Check if Binance returned an error dictionary instead of a list (IP Block)
         if isinstance(data, dict):
             print(f"⚠️ Binance API Error: {data.get('msg', 'Unknown Error')}", flush=True)
             return None
@@ -76,7 +75,6 @@ def get_bybit():
     try:
         data = requests.get(url, timeout=10).json()
         
-        # Bybit nests its data, check if it was successful
         if "result" not in data or "list" not in data["result"]:
             print(f"⚠️ Bybit API Error: {data.get('retMsg', 'Unknown Error')}", flush=True)
             return None
@@ -199,7 +197,7 @@ def fetch_binance_archive(symbol, tf):
     return pd.concat(all_df)
 
 # =============================
-# FETCH: LIVE (Fills the gap to current minute)
+# FETCH: LIVE (Fills the gap backward to avoid API bugs)
 # =============================
 def fetch_binance_live(symbol, tf, start_time_ms=None):
     print(f"⚡ Fetching LIVE gap for {symbol} {tf}", flush=True)
@@ -207,43 +205,60 @@ def fetch_binance_live(symbol, tf, start_time_ms=None):
     all_rows = []
     limit = 1500
     
-    # If no existing data, start from 0 to capture newly listed coins perfectly
+    # Target time: Where we want to stop fetching backward
     if start_time_ms is None:
-        start_time = 0
+        target_oldest_time = int((pd.Timestamp.now() - pd.DateOffset(years=2)).timestamp() * 1000)
     else:
-        start_time = start_time_ms
+        target_oldest_time = start_time_ms
         
     end_time = int(pd.Timestamp.now().timestamp() * 1000)
 
-    if start_time >= end_time:
+    # Safety check: If our target is in the future, do nothing
+    if target_oldest_time >= end_time:
         return None
 
-    while start_time < end_time:
-        url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={tf}&startTime={start_time}&limit={limit}"
+    while True:
+        # NOTICE: We use endTime here to walk backward!
+        url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={tf}&endTime={end_time}&limit={limit}"
         
         try:
             res = requests.get(url, timeout=10)
             data = res.json()
             
-            if not data or isinstance(data, dict): 
+            # Print explicit API errors instead of silently failing
+            if isinstance(data, dict): 
+                print(f"⚠️ Live API Error {symbol} {tf}: {data.get('msg', data)}", flush=True)
+                break
+
+            # If no data returned, we've walked back as far as Binance allows
+            if not data:
                 break
 
             for row in data:
-                all_rows.append({
-                    "time": row[0],
-                    "open": float(row[1]),
-                    "high": float(row[2]),
-                    "low": float(row[3]),
-                    "close": float(row[4]),
-                    "volume": float(row[5])
-                })
+                # Only keep the candles that are newer than our target time
+                if row[0] >= target_oldest_time:
+                    all_rows.append({
+                        "time": row[0],
+                        "open": float(row[1]),
+                        "high": float(row[2]),
+                        "low": float(row[3]),
+                        "close": float(row[4]),
+                        "volume": float(row[5])
+                    })
 
-            # If Binance returns fewer than the limit, we've hit the present moment
+            oldest_in_batch = data[0][0]
+
+            # Break if we've successfully walked back past our target time
+            if oldest_in_batch <= target_oldest_time:
+                break
+
+            # Break if Binance returned less than the limit (we hit the coin's launch date)
             if len(data) < limit:
                 break
 
-            start_time = data[-1][0] + 1
-            time.sleep(0.1) # Brief pause to prevent rate-limiting
+            # Step backward: set the next end_time to the candle just before the oldest one we just got
+            end_time = oldest_in_batch - 1
+            time.sleep(0.1) # Rate limit protection
 
         except Exception as e:
             print(f"❌ Live fetch error {symbol} {tf}: {e}", flush=True)
@@ -254,6 +269,9 @@ def fetch_binance_live(symbol, tf, start_time_ms=None):
 
     df = pd.DataFrame(all_rows)
     df["time"] = pd.to_datetime(df["time"], unit="ms")
+    
+    # Sort chronologically to fix the backward fetching order
+    df = df.sort_values("time").drop_duplicates(subset=["time"])
     return df
 
 # =============================
@@ -269,36 +287,30 @@ def process_symbol(symbol):
         df_list = []
         last_timestamp_ms = None
 
-        # 1. Load Existing Data from R2
         if existing is not None and not existing.empty:
             existing["time"] = pd.to_datetime(existing["time"], unit="ms")
             df_list.append(existing)
             last_timestamp_ms = int(existing["time"].max().timestamp() * 1000) + 1
             
         else:
-            # 2. No existing data? Fetch bulk history from Archive
             archive_df = fetch_binance_archive(sym, tf)
             if archive_df is not None and not archive_df.empty:
                 df_list.append(archive_df)
                 last_timestamp_ms = int(archive_df["time"].max().timestamp() * 1000) + 1
 
-        # 3. Fetch the Live Gap
         live_df = fetch_binance_live(sym, tf, start_time_ms=last_timestamp_ms)
         if live_df is not None and not live_df.empty:
             df_list.append(live_df)
 
-        # 4. Merge, Clean, and Upload
         if not df_list:
             print(f"❌ No data found anywhere for {sym} {tf}", flush=True)
             continue
 
         df = pd.concat(df_list, ignore_index=True)
 
-        # Cutoff to keep database manageable (2 years)
         cutoff = pd.Timestamp.now() - pd.DateOffset(years=2)
         df = df[df["time"] >= cutoff]
 
-        # Clean duplicates and sort
         df = df.drop_duplicates(subset=["time"]).sort_values("time")
 
         upload(df, base_path)
@@ -309,11 +321,9 @@ def process_symbol(symbol):
 def main():
     print("🚀 UNIFIED PIPELINE STARTING", flush=True)
 
-    # 1. Scrape fresh top symbols from exchanges
     binance_symbols = get_binance()
     bybit_symbols = get_bybit()
 
-    # 2. FALLBACK LOGIC: If live fetch fails, load the last known list from R2
     if not binance_symbols:
         print("⚠️ Falling back to existing Binance symbols from R2...", flush=True)
         binance_symbols = load_json("state/binance_symbols.json", {"symbols": []})["symbols"]
@@ -326,26 +336,21 @@ def main():
     else:
         save_json("state/bybit_symbols.json", {"symbols": bybit_symbols})
 
-    # If both the API and R2 are empty, we have to stop
     if not binance_symbols:
         print("❌ Critical: No Binance symbols available. Exiting.", flush=True)
         return
 
-    # 3. Load rotation state (Even with 400 chunk size, this ensures stability)
     state = load_json("state/rotation.json", {"index": 0})
     start = state["index"]
     end = start + CHUNK_SIZE
     
-    # Slice the newly fetched binance_symbols list directly
     selected = binance_symbols[start:end]
 
-    # Reset rotation if we hit the end
     state["index"] = 0 if end >= len(binance_symbols) else end
     save_json("state/rotation.json", state)
 
     print(f"Processing {start} → {end} ({len(selected)} symbols)", flush=True)
 
-    # 4. Execute the hybrid fetching pipeline on all selected symbols
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         executor.map(process_symbol, selected)
 
