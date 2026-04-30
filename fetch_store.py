@@ -13,9 +13,8 @@ from botocore.config import Config
 # =============================
 # CONFIG
 # =============================
-
 CHUNK_SIZE = 400 
-MAX_WORKERS = 10 
+MAX_WORKERS = 15 
 UPLOAD_CHUNK_ROWS = 100000
 
 TIMEFRAMES = ["1m","5m","15m","30m","1h","4h","1d","1w"]
@@ -29,7 +28,6 @@ BINANCE_BASE = "https://data.binance.vision/data/futures/um/monthly/klines"
 # =============================
 # R2 CONFIG
 # =============================
-
 R2_ENDPOINT = os.getenv("R2_ENDPOINT")
 R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY")
 R2_SECRET_KEY = os.getenv("R2_SECRET_KEY")
@@ -52,9 +50,27 @@ print("BUCKET:", BUCKET, flush=True)
 print("ENDPOINT:", R2_ENDPOINT, flush=True)
 
 # =============================
+# PHASE 1: SCOUT FUNCTIONS
+# =============================
+def get_binance():
+    print("Fetching top Binance symbols...", flush=True)
+    url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+    data = requests.get(url).json()
+    usdt = [x for x in data if x["symbol"].endswith("USDT")]
+    sorted_data = sorted(usdt, key=lambda x: float(x["quoteVolume"]), reverse=True)
+    return [{"symbol": x["symbol"]} for x in sorted_data[:400]]
+
+def get_bybit():
+    print("Fetching top Bybit symbols...", flush=True)
+    url = "https://api.bybit.com/v5/market/tickers?category=linear"
+    data = requests.get(url).json()
+    symbols = data["result"]["list"]
+    sorted_data = sorted(symbols, key=lambda x: float(x.get("turnover24h", 0)), reverse=True)
+    return [{"symbol": x["symbol"]} for x in sorted_data[:400]]
+
+# =============================
 # HELPERS
 # =============================
-
 def load_json(key, default):
     try:
         obj = s3.get_object(Bucket=BUCKET, Key=key)
@@ -64,6 +80,7 @@ def load_json(key, default):
 
 def save_json(key, data):
     s3.put_object(Bucket=BUCKET, Key=key, Body=json.dumps(data))
+    print(f"✅ Saved state: {key}", flush=True)
 
 def get_existing(path):
     try:
@@ -76,7 +93,6 @@ def get_existing(path):
 # =============================
 # FIXED CHUNKED UPLOAD
 # =============================
-
 def upload(df, base_path):
     total_rows = len(df)
     chunks = (total_rows // UPLOAD_CHUNK_ROWS) + 1
@@ -105,7 +121,6 @@ def upload(df, base_path):
                 ContentType="application/json",
                 ContentEncoding="gzip"
             )
-
             print(f"📡 {path} → {response['ResponseMetadata']['HTTPStatusCode']}", flush=True)
 
         except Exception as e:
@@ -115,7 +130,6 @@ def upload(df, base_path):
 # =============================
 # CLEAN
 # =============================
-
 def clean_dataframe(df):
     df.columns = ["time","open","high","low","close","volume","_","_","_","_","_","_"]
     df = df[["time","open","high","low","close","volume"]]
@@ -132,10 +146,9 @@ def clean_dataframe(df):
     return df
 
 # =============================
-# FETCH: ARCHIVE (Used for bulk history)
+# FETCH: ARCHIVE (Bulk history)
 # =============================
-
-def fetch_binance(symbol, tf):
+def fetch_binance_archive(symbol, tf):
     all_df = []
     print(f"📥 Fetching Archive {symbol} {tf}", flush=True)
 
@@ -166,16 +179,14 @@ def fetch_binance(symbol, tf):
     return pd.concat(all_df)
 
 # =============================
-# FETCH: LIVE (Used to fill the gap to current minute)
+# FETCH: LIVE (Fills the gap to current minute)
 # =============================
-
 def fetch_binance_live(symbol, tf, start_time_ms=None):
     print(f"⚡ Fetching LIVE gap for {symbol} {tf}", flush=True)
     
     all_rows = []
     limit = 1500
     
-    # If no start time, fetch the last 2 years. Otherwise, start from the gap.
     if start_time_ms is None:
         start_time = int((pd.Timestamp.now() - pd.DateOffset(years=2)).timestamp() * 1000)
     else:
@@ -183,7 +194,6 @@ def fetch_binance_live(symbol, tf, start_time_ms=None):
         
     end_time = int(pd.Timestamp.now().timestamp() * 1000)
 
-    # Stop if we are already fully up to date
     if start_time >= end_time:
         return None
 
@@ -194,7 +204,6 @@ def fetch_binance_live(symbol, tf, start_time_ms=None):
             res = requests.get(url, timeout=10)
             data = res.json()
             
-            # Break if Binance returns an empty list or an error message
             if not data or isinstance(data, dict): 
                 break
 
@@ -208,7 +217,6 @@ def fetch_binance_live(symbol, tf, start_time_ms=None):
                     "volume": float(row[5])
                 })
 
-            # Update start_time for next page (+1 ms to avoid duplicates)
             start_time = data[-1][0] + 1
             time.sleep(0.1) # Brief pause to prevent rate-limiting
 
@@ -226,7 +234,6 @@ def fetch_binance_live(symbol, tf, start_time_ms=None):
 # =============================
 # PROCESS
 # =============================
-
 def process_symbol(symbol):
     sym = symbol["symbol"]
 
@@ -241,17 +248,16 @@ def process_symbol(symbol):
         if existing is not None and not existing.empty:
             existing["time"] = pd.to_datetime(existing["time"], unit="ms")
             df_list.append(existing)
-            # Find the exact timestamp of our last saved candle (+1 ms)
             last_timestamp_ms = int(existing["time"].max().timestamp() * 1000) + 1
             
         else:
             # 2. No existing data? Fetch bulk history from Archive
-            archive_df = fetch_binance(sym, tf)
+            archive_df = fetch_binance_archive(sym, tf)
             if archive_df is not None and not archive_df.empty:
                 df_list.append(archive_df)
                 last_timestamp_ms = int(archive_df["time"].max().timestamp() * 1000) + 1
 
-        # 3. Fetch the Live Gap (from the last timestamp right up to NOW)
+        # 3. Fetch the Live Gap
         live_df = fetch_binance_live(sym, tf, start_time_ms=last_timestamp_ms)
         if live_df is not None and not live_df.empty:
             df_list.append(live_df)
@@ -263,11 +269,11 @@ def process_symbol(symbol):
 
         df = pd.concat(df_list, ignore_index=True)
 
-        # Cutoff to keep database size manageable (2 years)
+        # Cutoff to keep database manageable (2 years)
         cutoff = pd.Timestamp.now() - pd.DateOffset(years=2)
         df = df[df["time"] >= cutoff]
 
-        # Ensure no accidental duplicates and sort perfectly by time
+        # Clean duplicates and sort
         df = df.drop_duplicates(subset=["time"]).sort_values("time")
 
         upload(df, base_path)
@@ -275,26 +281,36 @@ def process_symbol(symbol):
 # =============================
 # MAIN
 # =============================
-
 def main():
-    print("🚀 HYBRID PIPELINE STARTING", flush=True)
+    print("🚀 UNIFIED PIPELINE STARTING", flush=True)
 
-    symbols = load_json("state/binance_symbols.json", {"symbols": []})["symbols"]
+    # 1. Scrape fresh top symbols from exchanges
+    binance_symbols = get_binance()
+    bybit_symbols = get_bybit()
+
+    # 2. Save them to R2 so you always have a record of what is active
+    save_json("state/binance_symbols.json", {"symbols": binance_symbols})
+    save_json("state/bybit_symbols.json", {"symbols": bybit_symbols})
+
+    # 3. Load rotation state (Even with 400 chunk size, this ensures stability)
     state = load_json("state/rotation.json", {"index": 0})
-
     start = state["index"]
     end = start + CHUNK_SIZE
-    selected = symbols[start:end]
+    
+    # Slice the newly fetched binance_symbols list directly
+    selected = binance_symbols[start:end]
 
-    state["index"] = 0 if end >= len(symbols) else end
+    # Reset rotation if we hit the end
+    state["index"] = 0 if end >= len(binance_symbols) else end
     save_json("state/rotation.json", state)
 
-    print(f"Processing {start} → {end}", flush=True)
+    print(f"Processing {start} → {end} ({len(selected)} symbols)", flush=True)
 
+    # 4. Execute the hybrid fetching pipeline on all selected symbols
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         executor.map(process_symbol, selected)
 
-    print("✅ DONE", flush=True)
+    print("✅ PIPELINE COMPLETE", flush=True)
 
 if __name__ == "__main__":
     main()
