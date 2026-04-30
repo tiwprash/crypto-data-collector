@@ -207,8 +207,9 @@ def fetch_binance_live(symbol, tf, start_time_ms=None):
     all_rows = []
     limit = 1500
     
+    # If no existing data, start from 0 to capture newly listed coins perfectly
     if start_time_ms is None:
-        start_time = int((pd.Timestamp.now() - pd.DateOffset(years=2)).timestamp() * 1000)
+        start_time = 0
     else:
         start_time = start_time_ms
         
@@ -236,6 +237,10 @@ def fetch_binance_live(symbol, tf, start_time_ms=None):
                     "close": float(row[4]),
                     "volume": float(row[5])
                 })
+
+            # If Binance returns fewer than the limit, we've hit the present moment
+            if len(data) < limit:
+                break
 
             start_time = data[-1][0] + 1
             time.sleep(0.1) # Brief pause to prevent rate-limiting
