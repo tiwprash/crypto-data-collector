@@ -15,7 +15,7 @@ from botocore.config import Config
 # =============================
 
 # Increased to process 3 hours worth of coins in a single run
-CHUNK_SIZE = 150 
+CHUNK_SIZE = 400 
 # Increased to speed up parallel downloads and save Action minutes
 MAX_WORKERS = 10 
 UPLOAD_CHUNK_ROWS = 100000
