@@ -25,6 +25,9 @@ START_YEAR = CURRENT_YEAR - 1
 
 BINANCE_BASE = "https://data.binance.vision/data/futures/um/monthly/klines"
 
+# 👉 THIS IS YOUR NEW UNBLOCKABLE PROXY 
+WORKER_URL = "https://binance-proxy.mr-tiwari2021.workers.dev"
+
 # =============================
 # R2 CONFIG
 # =============================
@@ -54,7 +57,8 @@ print("ENDPOINT:", R2_ENDPOINT, flush=True)
 # =============================
 def get_binance():
     print("Fetching top Binance symbols...", flush=True)
-    url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+    # 👉 ROUTED THROUGH CLOUDFLARE WORKER
+    url = f"{WORKER_URL}/fapi/v1/ticker/24hr"
     try:
         data = requests.get(url, timeout=10).json()
         
@@ -205,7 +209,6 @@ def fetch_binance_live(symbol, tf, start_time_ms=None):
     all_rows = []
     limit = 1500
     
-    # Target time: Where we want to stop fetching backward
     if start_time_ms is None:
         target_oldest_time = int((pd.Timestamp.now() - pd.DateOffset(years=2)).timestamp() * 1000)
     else:
@@ -213,29 +216,25 @@ def fetch_binance_live(symbol, tf, start_time_ms=None):
         
     end_time = int(pd.Timestamp.now().timestamp() * 1000)
 
-    # Safety check: If our target is in the future, do nothing
     if target_oldest_time >= end_time:
         return None
 
     while True:
-        # NOTICE: We use endTime here to walk backward!
-        url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={tf}&endTime={end_time}&limit={limit}"
+        # 👉 ROUTED THROUGH CLOUDFLARE WORKER
+        url = f"{WORKER_URL}/fapi/v1/klines?symbol={symbol}&interval={tf}&endTime={end_time}&limit={limit}"
         
         try:
             res = requests.get(url, timeout=10)
             data = res.json()
             
-            # Print explicit API errors instead of silently failing
             if isinstance(data, dict): 
                 print(f"⚠️ Live API Error {symbol} {tf}: {data.get('msg', data)}", flush=True)
                 break
 
-            # If no data returned, we've walked back as far as Binance allows
             if not data:
                 break
 
             for row in data:
-                # Only keep the candles that are newer than our target time
                 if row[0] >= target_oldest_time:
                     all_rows.append({
                         "time": row[0],
@@ -248,17 +247,14 @@ def fetch_binance_live(symbol, tf, start_time_ms=None):
 
             oldest_in_batch = data[0][0]
 
-            # Break if we've successfully walked back past our target time
             if oldest_in_batch <= target_oldest_time:
                 break
 
-            # Break if Binance returned less than the limit (we hit the coin's launch date)
             if len(data) < limit:
                 break
 
-            # Step backward: set the next end_time to the candle just before the oldest one we just got
             end_time = oldest_in_batch - 1
-            time.sleep(0.1) # Rate limit protection
+            time.sleep(0.1) 
 
         except Exception as e:
             print(f"❌ Live fetch error {symbol} {tf}: {e}", flush=True)
@@ -270,7 +266,6 @@ def fetch_binance_live(symbol, tf, start_time_ms=None):
     df = pd.DataFrame(all_rows)
     df["time"] = pd.to_datetime(df["time"], unit="ms")
     
-    # Sort chronologically to fix the backward fetching order
     df = df.sort_values("time").drop_duplicates(subset=["time"])
     return df
 
