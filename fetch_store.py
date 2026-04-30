@@ -14,7 +14,7 @@ from botocore.config import Config
 # CONFIG
 # =============================
 
-CHUNK_SIZE = 150 
+CHUNK_SIZE = 400 
 MAX_WORKERS = 10 
 UPLOAD_CHUNK_ROWS = 100000
 
