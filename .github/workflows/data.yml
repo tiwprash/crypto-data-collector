@@ -2,7 +2,8 @@ name: Fetch Crypto Data
 
 on:
   schedule:
-    - cron: "0 * * * *"
+    # Changed from every hour to every 12 hours
+    - cron: "0 */12 * * *"
   workflow_dispatch:
 
 jobs:
