@@ -21,7 +21,7 @@ TIMEFRAMES = ["1m","5m","15m","30m","1h","4h","1d","1w"]
 
 CURRENT_YEAR = int(time.strftime("%Y"))
 CURRENT_MONTH = int(time.strftime("%m"))
-START_YEAR = CURRENT_YEAR - 1
+START_YEAR = CURRENT_YEAR - 5  # <-- Changed to fetch 5 years of bulk data
 
 BINANCE_BASE = "https://data.binance.vision/data/futures/um/monthly/klines"
 
@@ -57,7 +57,6 @@ print("ENDPOINT:", R2_ENDPOINT, flush=True)
 # =============================
 def get_binance():
     print("Fetching top Binance symbols...", flush=True)
-    # 👉 ROUTED THROUGH CLOUDFLARE WORKER
     url = f"{WORKER_URL}/fapi/v1/ticker/24hr"
     try:
         data = requests.get(url, timeout=10).json()
@@ -168,11 +167,11 @@ def clean_dataframe(df):
     return df
 
 # =============================
-# FETCH: ARCHIVE (Bulk history)
+# FETCH: ARCHIVE (Bulk history ONLY)
 # =============================
 def fetch_binance_archive(symbol, tf):
     all_df = []
-    print(f"📥 Fetching Archive {symbol} {tf}", flush=True)
+    print(f"📥 Fetching Bulk Archive {symbol} {tf}", flush=True)
 
     for year in range(START_YEAR, CURRENT_YEAR + 1):
         for month in range(1, 13):
@@ -201,75 +200,6 @@ def fetch_binance_archive(symbol, tf):
     return pd.concat(all_df)
 
 # =============================
-# FETCH: LIVE (Fills the gap backward to avoid API bugs)
-# =============================
-def fetch_binance_live(symbol, tf, start_time_ms=None):
-    print(f"⚡ Fetching LIVE gap for {symbol} {tf}", flush=True)
-    
-    all_rows = []
-    limit = 1500
-    
-    if start_time_ms is None:
-        target_oldest_time = int((pd.Timestamp.now() - pd.DateOffset(years=2)).timestamp() * 1000)
-    else:
-        target_oldest_time = start_time_ms
-        
-    end_time = int(pd.Timestamp.now().timestamp() * 1000)
-
-    if target_oldest_time >= end_time:
-        return None
-
-    while True:
-        # 👉 ROUTED THROUGH CLOUDFLARE WORKER
-        url = f"{WORKER_URL}/fapi/v1/klines?symbol={symbol}&interval={tf}&endTime={end_time}&limit={limit}"
-        
-        try:
-            res = requests.get(url, timeout=10)
-            data = res.json()
-            
-            if isinstance(data, dict): 
-                print(f"⚠️ Live API Error {symbol} {tf}: {data.get('msg', data)}", flush=True)
-                break
-
-            if not data:
-                break
-
-            for row in data:
-                if row[0] >= target_oldest_time:
-                    all_rows.append({
-                        "time": row[0],
-                        "open": float(row[1]),
-                        "high": float(row[2]),
-                        "low": float(row[3]),
-                        "close": float(row[4]),
-                        "volume": float(row[5])
-                    })
-
-            oldest_in_batch = data[0][0]
-
-            if oldest_in_batch <= target_oldest_time:
-                break
-
-            if len(data) < limit:
-                break
-
-            end_time = oldest_in_batch - 1
-            time.sleep(0.1) 
-
-        except Exception as e:
-            print(f"❌ Live fetch error {symbol} {tf}: {e}", flush=True)
-            break
-
-    if not all_rows:
-        return None
-
-    df = pd.DataFrame(all_rows)
-    df["time"] = pd.to_datetime(df["time"], unit="ms")
-    
-    df = df.sort_values("time").drop_duplicates(subset=["time"])
-    return df
-
-# =============================
 # PROCESS
 # =============================
 def process_symbol(symbol):
@@ -280,32 +210,28 @@ def process_symbol(symbol):
         existing = get_existing(base_path)
 
         df_list = []
-        last_timestamp_ms = None
 
+        # 1. Load existing data from R2 if any
         if existing is not None and not existing.empty:
             existing["time"] = pd.to_datetime(existing["time"], unit="ms")
             df_list.append(existing)
-            last_timestamp_ms = int(existing["time"].max().timestamp() * 1000) + 1
             
-        else:
-            archive_df = fetch_binance_archive(sym, tf)
-            if archive_df is not None and not archive_df.empty:
-                df_list.append(archive_df)
-                last_timestamp_ms = int(archive_df["time"].max().timestamp() * 1000) + 1
-
-        live_df = fetch_binance_live(sym, tf, start_time_ms=last_timestamp_ms)
-        if live_df is not None and not live_df.empty:
-            df_list.append(live_df)
+        # 2. Fetch bulk archive data
+        archive_df = fetch_binance_archive(sym, tf)
+        if archive_df is not None and not archive_df.empty:
+            df_list.append(archive_df)
 
         if not df_list:
-            print(f"❌ No data found anywhere for {sym} {tf}", flush=True)
+            print(f"❌ No bulk data found anywhere for {sym} {tf}", flush=True)
             continue
 
         df = pd.concat(df_list, ignore_index=True)
 
-        cutoff = pd.Timestamp.now() - pd.DateOffset(years=2)
+        # 3. Trim to exactly 5 years based on current time
+        cutoff = pd.Timestamp.now() - pd.DateOffset(years=5)
         df = df[df["time"] >= cutoff]
 
+        # 4. Clean up overlaps and sort
         df = df.drop_duplicates(subset=["time"]).sort_values("time")
 
         upload(df, base_path)
@@ -314,7 +240,7 @@ def process_symbol(symbol):
 # MAIN
 # =============================
 def main():
-    print("🚀 UNIFIED PIPELINE STARTING", flush=True)
+    print("🚀 UNIFIED BULK PIPELINE STARTING", flush=True)
 
     binance_symbols = get_binance()
     bybit_symbols = get_bybit()
@@ -349,7 +275,7 @@ def main():
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         executor.map(process_symbol, selected)
 
-    print("✅ PIPELINE COMPLETE", flush=True)
+    print("✅ BULK PIPELINE COMPLETE", flush=True)
 
 if __name__ == "__main__":
     main()
